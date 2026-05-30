@@ -1,0 +1,33 @@
+# Environment and config
+.env
+config/settings.json
+
+# Database and cache
+data/*.db
+data/*.pkl
+data/*.json
+data/thumbnails/*
+data/face_crops/*
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
