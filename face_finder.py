@@ -93,6 +93,50 @@ class DB:
         self.conn.execute("UPDATE faces SET cluster_id=? WHERE id=?", (cluster_id, face_id))
         self.conn.commit()
 
+    def get_named_face_ids(self):
+        """Return dict of face_id -> person_name for all NAMED faces."""
+        rows = self.conn.execute(
+            "SELECT id, person_name FROM faces WHERE person_name != '' AND person_name IS NOT NULL"
+        ).fetchall()
+        return {r["id"]: r["person_name"] for r in rows}
+
+    def has_named_clusters(self):
+        """Return True if any clusters have been labeled by the user."""
+        row = self.conn.execute(
+            "SELECT COUNT(*) FROM clusters WHERE person_name != '' AND person_name IS NOT NULL"
+        ).fetchone()
+        return (row[0] or 0) > 0
+
+    def restore_names_after_cluster(self, face_id_to_name):
+        """
+        After re-clustering, restore names by:
+        For each face that had a name before clustering, find which new cluster_id
+        it now belongs to and set that cluster's name.
+        Multiple faces from the same old cluster will all point to the same new cluster_id.
+        """
+        # face_id -> new cluster_id (already written by update_face_cluster)
+        cluster_votes = {}  # new_cluster_id -> {name: count}
+        for face_id, name in face_id_to_name.items():
+            row = self.conn.execute("SELECT cluster_id FROM faces WHERE id=?", (face_id,)).fetchone()
+            if not row or row["cluster_id"] < 0:
+                continue
+            new_cid = row["cluster_id"]
+            if new_cid not in cluster_votes:
+                cluster_votes[new_cid] = {}
+            cluster_votes[new_cid][name] = cluster_votes[new_cid].get(name, 0) + 1
+
+        # For each new cluster, assign the name that got the most votes
+        for new_cid, votes in cluster_votes.items():
+            best_name = max(votes, key=votes.get)
+            self.conn.execute(
+                "INSERT OR REPLACE INTO clusters (id, person_name) VALUES (?,?)",
+                (new_cid, best_name))
+            self.conn.execute(
+                "UPDATE faces SET person_name=? WHERE cluster_id=?",
+                (best_name, new_cid))
+        self.conn.commit()
+        return len(cluster_votes)
+
     def update_cluster_name(self, cluster_id, name):
         self.conn.execute("INSERT OR REPLACE INTO clusters (id,person_name) VALUES (?,?)", (cluster_id, name))
         self.conn.execute("UPDATE faces SET person_name=? WHERE cluster_id=?", (name, cluster_id))
@@ -1508,6 +1552,21 @@ class App:
             messagebox.showinfo("No Faces", "No faces found. Run Detect Faces first.")
             return
 
+        # Warn user if they have named clusters — re-clustering will reassign IDs
+        # but we will try to restore names automatically
+        if self.db.has_named_clusters():
+            answer = messagebox.askyesno(
+                "Named Clusters Detected",
+                "You have labeled clusters.\n\n"
+                "Re-clustering will reassign cluster IDs, but the app will\n"
+                "AUTOMATICALLY restore your labels to the correct clusters\n"
+                "based on which faces they contain.\n\n"
+                "Proceed?",
+                icon="warning"
+            )
+            if not answer:
+                return
+
         # DBSCAN eps dialog — lower = stricter = less mixing
         tol = simpledialog.askfloat("Clustering Strictness",
             "How strictly should faces be grouped?\n\n"
@@ -1521,6 +1580,9 @@ class App:
         if tol is None:
             return
 
+        # Save existing face_id -> name mappings BEFORE clustering destroys them
+        face_id_to_name = self.db.get_named_face_ids()
+
         self.progress.start()
         self.show_loading(
             "Clustering " + str(len(rows)) + " faces with ArcFace...\n"
@@ -1530,14 +1592,27 @@ class App:
         def run():
             embs   = [json.loads(r["embedding"]) for r in rows]
             labels = self.engine.cluster_embeddings(embs, eps=tol)
+
+            # First clear ALL existing cluster_ids and names so we start clean
+            self.db.conn.execute("UPDATE faces SET cluster_id=-1, person_name=''")
+            self.db.conn.execute("DELETE FROM clusters")
+            self.db.conn.commit()
+
+            # Write new cluster assignments
             for row, label in zip(rows, labels):
                 self.db.update_face_cluster(row["id"], label)
+
+            # Restore user-given names by matching face IDs to new cluster IDs
+            restored = 0
+            if face_id_to_name:
+                restored = self.db.restore_names_after_cluster(face_id_to_name)
+
             n = len(set(l for l in labels if l >= 0))
-            self.root.after(0, lambda: self._cluster_done(n))
+            self.root.after(0, lambda: self._cluster_done(n, restored))
 
         threading.Thread(target=run, daemon=True).start()
 
-    def _cluster_done(self, n):
+    def _cluster_done(self, n, restored=0):
         self.progress.stop()
         self.hide_loading()
         self.face_thumb_cache.clear()
@@ -1547,9 +1622,10 @@ class App:
         except:
             pass
         self.status("Found " + str(n) + " clusters. Select one on the left.")
-        messagebox.showinfo("Done",
-                            "Found " + str(n) + " clusters!\n"
-                            "Select one on the left to view photos.")
+        msg = "Found " + str(n) + " clusters!\nSelect one on the left to view photos."
+        if restored > 0:
+            msg += "\n\n" + str(restored) + " of your labels were automatically restored."
+        messagebox.showinfo("Done", msg)
 
     # ── Cluster Sidebar ───────────────────────────────────────────────────────
     def _get_face_thumb(self, cluster_id):
