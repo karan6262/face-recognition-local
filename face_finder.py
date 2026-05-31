@@ -612,142 +612,312 @@ class App:
     # ── Import from Google Photos Shared Album ────────────────────────────────
     def import_google_photos(self):
         """
-        Download all photos from a public Google Photos shared album link.
-        Requires: pip install gallery-dl requests beautifulsoup4
-        Supports links like:
-          https://photos.app.goo.gl/XXXXXXX
-          https://photos.google.com/share/XXXXXXX
+        Full flow:
+        Step 1 - User pastes URL and picks save folder
+        Step 2 - App fetches album info (photo count + estimated size)
+        Step 3 - Confirmation dialog shows details before any download
+        Step 4 - Downloads with live per-photo progress bar
+        Step 5 - Auto-starts face detection after download
         """
-        # ── Show input dialog ──
+        import subprocess, sys, re
+
         win = tk.Toplevel(self.root)
         win.title("Import from Google Photos")
-        win.geometry("580x320")
+        win.geometry("600x440")
         win.resizable(False, False)
         win.configure(bg=BG2)
         win.grab_set()
 
+        # ── Header ──────────────────────────────────────────────────────────
         tk.Label(win, text="Import Google Photos Album",
-                 bg=BG2, fg=ACCENT, font=("Segoe UI", 13, "bold")).pack(pady=(20, 4))
-        tk.Label(win,
-                 text="Paste a PUBLIC Google Photos shared album link below.\n"
-                      "The album must be set to 'Anyone with the link can view'.",
-                 bg=BG2, fg=MUTED, font=("Segoe UI", 9), justify="center").pack(pady=(0, 12))
+                 bg=BG2, fg=ACCENT, font=("Segoe UI", 14, "bold")).pack(pady=(18, 2))
+        tk.Label(win, text="Paste a PUBLIC shared album link  (Anyone with link can view)",
+                 bg=BG2, fg=MUTED, font=("Segoe UI", 9)).pack(pady=(0, 10))
 
+        # ── URL input ────────────────────────────────────────────────────────
+        url_frame = tk.Frame(win, bg=BG2)
+        url_frame.pack(fill=tk.X, padx=28)
+        tk.Label(url_frame, text="Album URL:", bg=BG2, fg=TEXT,
+                 font=("Segoe UI", 9, "bold")).pack(anchor="w")
         url_var = tk.StringVar()
-        entry = ttk.Entry(win, textvariable=url_var, width=56,
-                          font=("Segoe UI", 10))
-        entry.pack(padx=24, pady=4)
-        entry.focus()
+        url_entry = ttk.Entry(url_frame, textvariable=url_var, width=62,
+                              font=("Segoe UI", 10))
+        url_entry.pack(fill=tk.X, pady=(2, 10))
+        url_entry.focus()
 
-        # Download folder info
-        GPHOTO_DIR = DATA_DIR / "google_photos"
-        tk.Label(win, text="Photos saved to: " + str(GPHOTO_DIR),
-                 bg=BG2, fg=MUTED, font=("Segoe UI", 8)).pack(pady=(4, 0))
+        # ── Save folder picker ───────────────────────────────────────────────
+        folder_frame = tk.Frame(win, bg=BG2)
+        folder_frame.pack(fill=tk.X, padx=28)
+        tk.Label(folder_frame, text="Save photos to:", bg=BG2, fg=TEXT,
+                 font=("Segoe UI", 9, "bold")).pack(anchor="w")
+        folder_row = tk.Frame(folder_frame, bg=BG2)
+        folder_row.pack(fill=tk.X, pady=(2, 4))
+        save_dir_var = tk.StringVar(value=str(DATA_DIR / "google_photos"))
+        ttk.Entry(folder_row, textvariable=save_dir_var, width=48,
+                  font=("Segoe UI", 9)).pack(side=tk.LEFT, fill=tk.X, expand=True)
 
-        status_lbl = tk.Label(win, text="", bg=BG2, fg=GREEN, font=("Segoe UI", 9))
-        status_lbl.pack(pady=4)
+        def pick_folder():
+            chosen = filedialog.askdirectory(title="Choose where to save photos",
+                                             initialdir=save_dir_var.get())
+            if chosen:
+                save_dir_var.set(chosen)
 
-        pbar = ttk.Progressbar(win, mode="indeterminate", length=520)
-        pbar.pack(padx=24, pady=4)
+        tk.Button(folder_row, text="Browse...", command=pick_folder,
+                  bg=BTN_BG, fg=TEXT, relief="flat", padx=8, pady=4,
+                  font=("Segoe UI", 9), cursor="hand2", bd=0,
+                  activebackground=BTN_HOV).pack(side=tk.LEFT, padx=(6, 0))
 
-        def set_status(msg, color=GREEN):
-            status_lbl.config(text=msg, fg=color)
+        # ── Separator ────────────────────────────────────────────────────────
+        tk.Frame(win, bg=BORDER, height=1).pack(fill=tk.X, padx=28, pady=10)
+
+        # ── Info / status area ───────────────────────────────────────────────
+        info_var   = tk.StringVar(value="Click 'Check Album' to fetch photo count and size.")
+        status_var = tk.StringVar(value="")
+        tk.Label(win, textvariable=info_var, bg=BG2, fg=TEXT,
+                 font=("Segoe UI", 10), justify="left").pack(padx=28, anchor="w")
+        status_lbl = tk.Label(win, textvariable=status_var, bg=BG2, fg=MUTED,
+                              font=("Segoe UI", 9))
+        status_lbl.pack(padx=28, anchor="w", pady=(2, 0))
+
+        # ── Progress bar (shown only during download) ────────────────────────
+        pbar_outer = tk.Frame(win, bg=BG2)
+        pbar_outer.pack(fill=tk.X, padx=28, pady=4)
+        pbar = ttk.Progressbar(pbar_outer, mode="determinate", length=544)
+        pbar_lbl = tk.Label(pbar_outer, text="", bg=BG2, fg=MUTED, font=("Segoe UI", 8))
+
+        # ── Buttons ──────────────────────────────────────────────────────────
+        tk.Frame(win, bg=BORDER, height=1).pack(fill=tk.X, padx=28, pady=(8, 0))
+        btn_row = tk.Frame(win, bg=BG2)
+        btn_row.pack(pady=10)
+
+        S = {"relief": "flat", "padx": 14, "pady": 7,
+             "font": ("Segoe UI", 10, "bold"), "cursor": "hand2", "bd": 0}
+
+        fetch_btn    = tk.Button(btn_row, text="Check Album",
+                                 bg=ACCENT2, fg="#fffdf9",
+                                 activebackground=ACCENT, **S)
+        fetch_btn.pack(side=tk.LEFT, padx=5)
+
+        download_btn = tk.Button(btn_row, text="Download & Detect Faces",
+                                 bg=GREEN, fg="#fffdf9",
+                                 activebackground="#4a7a4a", **S,
+                                 state="disabled")
+        download_btn.pack(side=tk.LEFT, padx=5)
+
+        tk.Button(btn_row, text="Cancel", command=win.destroy,
+                  bg=BTN_BG, fg=TEXT, relief="flat", padx=14, pady=7,
+                  font=("Segoe UI", 9), cursor="hand2", bd=0,
+                  activebackground=BTN_HOV).pack(side=tk.LEFT, padx=5)
+
+        tk.Label(win, text="Only PUBLIC albums work.  Private albums require Google OAuth login.",
+                 bg=BG2, fg=MUTED, font=("Segoe UI", 8)).pack(pady=(0, 8))
+
+        # ── Shared state dict ────────────────────────────────────────────────
+        album = {"urls": [], "count": 0, "est_mb": 0.0}
+
+        def set_info(msg):
+            info_var.set(msg)
             win.update_idletasks()
 
-        def do_import():
+        def set_status(msg, color=MUTED):
+            status_var.set(msg)
+            status_lbl.config(fg=color)
+            win.update_idletasks()
+
+        # ────────────────────────────────────────────────────────────────────
+        # STEP 1 — CHECK ALBUM INFO (no download yet)
+        # ────────────────────────────────────────────────────────────────────
+        def check_album():
             url = url_var.get().strip()
             if not url:
-                set_status("Please paste a URL first.", RED)
+                set_status("Please paste an album URL first.", RED)
                 return
             if "photos.app.goo.gl" not in url and "photos.google.com" not in url:
                 set_status("Not a valid Google Photos link.", RED)
                 return
 
-            pbar.start(10)
-            set_status("Checking gallery-dl installation...")
+            fetch_btn.config(state="disabled", text="Checking...")
+            download_btn.config(state="disabled")
+            set_info("Connecting to album, please wait...")
+            set_status("")
+            pbar.pack_forget()
+            pbar_lbl.pack_forget()
 
             def run():
                 try:
-                    # ── Step 1: Make sure gallery-dl is installed ──
-                    import subprocess, sys
                     try:
-                        import gallery_dl
+                        import requests
                     except ImportError:
-                        set_status("Installing gallery-dl (one-time)...")
-                        subprocess.check_call(
-                            [sys.executable, "-m", "pip", "install", "gallery-dl", "--quiet"],
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-                        )
-
-                    # ── Step 2: Also need requests + bs4 for fallback scraping ──
-                    try:
-                        import requests, bs4
-                    except ImportError:
+                        set_status("Installing requests...", YELLOW)
                         subprocess.check_call(
                             [sys.executable, "-m", "pip", "install",
                              "requests", "beautifulsoup4", "--quiet"],
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-                        )
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        import requests
 
-                    GPHOTO_DIR.mkdir(parents=True, exist_ok=True)
+                    headers = {
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                      "Chrome/120.0.0.0 Safari/537.36"
+                    }
+                    resp = requests.get(url, headers=headers, timeout=30)
+                    resp.raise_for_status()
 
-                    # ── Step 3: Download via gallery-dl ──
-                    set_status("Connecting to album...")
-                    result = subprocess.run(
-                        [sys.executable, "-m", "gallery_dl",
-                         "--dest", str(GPHOTO_DIR),
-                         "--no-mtime",
-                         url],
-                        capture_output=True, text=True, timeout=300
+                    # Extract Google Photos CDN URLs from page source
+                    raw = re.findall(
+                        r'https://lh3\.googleusercontent\.com/[A-Za-z0-9_\-]+'
+                        r'(?:=[A-Za-z0-9_\-\.]+)*',
+                        resp.text
                     )
+                    seen, clean = set(), []
+                    for u in raw:
+                        base = re.sub(r'=.*$', '', u)
+                        if base not in seen and len(base) > 60:
+                            seen.add(base)
+                            clean.append(base)
 
-                    # ── Step 4: Count downloaded images ──
-                    downloaded = list(GPHOTO_DIR.rglob("*"))
-                    images = [f for f in downloaded if f.suffix.lower() in SUPPORTED]
+                    count   = len(clean)
+                    est_mb  = round(count * 3.5, 1)
+                    est_gb  = round(est_mb / 1024, 2)
+                    sz_str  = (str(est_gb) + " GB") if est_mb > 1024 else (str(est_mb) + " MB")
 
-                    if not images and result.returncode != 0:
-                        # gallery-dl failed — try fallback HTML scraping
+                    album["urls"]   = clean
+                    album["count"]  = count
+                    album["est_mb"] = est_mb
+
+                    if count == 0:
+                        self.root.after(0, lambda: set_info(
+                            "No photos found in this album.\n"
+                            "Album may be private or require login."))
                         self.root.after(0, lambda: set_status(
-                            "gallery-dl failed, trying fallback method...", YELLOW))
-                        images = self._scrape_google_photos_fallback(url, GPHOTO_DIR)
-
-                    if not images:
-                        self.root.after(0, lambda: set_status(
-                            "No images downloaded. Album may be private or link invalid.", RED))
-                        self.root.after(0, pbar.stop)
+                            "Check album privacy settings.", RED))
+                        self.root.after(0, lambda: fetch_btn.config(
+                            state="normal", text="Check Album"))
                         return
 
-                    # ── Step 5: Add images to DB ──
-                    for img_path in images:
-                        self.db.add_image(str(img_path))
-
-                    count = len(images)
-                    self.root.after(0, lambda: self._gphoto_done(win, count))
-
-                except subprocess.TimeoutExpired:
+                    msg = (
+                        "Album found!\n\n"
+                        "   Photos found    :  " + str(count) + " images\n"
+                        "   Estimated size  :  " + sz_str +
+                        "  (approx. " + str(round(count * 3.5)) + " MB at ~3.5 MB/photo)\n"
+                        "   Save location   :  " + save_dir_var.get()
+                    )
+                    self.root.after(0, lambda: set_info(msg))
                     self.root.after(0, lambda: set_status(
-                        "Timeout — album may be very large or network is slow.", RED))
-                    self.root.after(0, pbar.stop)
+                        "Ready to download. Click 'Download & Detect Faces' to proceed.", GREEN))
+                    self.root.after(0, lambda: download_btn.config(state="normal"))
+                    self.root.after(0, lambda: fetch_btn.config(
+                        state="normal", text="Re-Check"))
+
                 except Exception as e:
-                    msg = str(e)[:80]
-                    self.root.after(0, lambda: set_status("Error: " + msg, RED))
-                    self.root.after(0, pbar.stop)
+                    err = str(e)[:100]
+                    self.root.after(0, lambda: set_info(""))
+                    self.root.after(0, lambda: set_status("Error: " + err, RED))
+                    self.root.after(0, lambda: fetch_btn.config(
+                        state="normal", text="Check Album"))
 
             threading.Thread(target=run, daemon=True).start()
 
-        btn_row = tk.Frame(win, bg=BG2)
-        btn_row.pack(pady=14)
-        btn_cfg2 = {"bg": ACCENT2, "fg": "#fffdf9", "relief": "flat",
-                    "padx": 16, "pady": 8, "font": ("Segoe UI", 10, "bold"),
-                    "cursor": "hand2", "bd": 0}
-        tk.Button(btn_row, text="Download Album", command=do_import, **btn_cfg2).pack(side=tk.LEFT, padx=8)
-        tk.Button(btn_row, text="Cancel", command=win.destroy,
-                  bg=BTN_BG, fg=TEXT, relief="flat", padx=16, pady=8,
-                  font=("Segoe UI", 9), cursor="hand2", bd=0).pack(side=tk.LEFT, padx=8)
+        fetch_btn.config(command=check_album)
 
-        tk.Label(win,
-                 text="Note: Only PUBLIC albums work. Private albums require Google OAuth login.",
-                 bg=BG2, fg=MUTED, font=("Segoe UI", 8)).pack(pady=(0, 12))
+        # ────────────────────────────────────────────────────────────────────
+        # STEP 2 — DOWNLOAD WITH LIVE PROGRESS + AUTO DETECT
+        # ────────────────────────────────────────────────────────────────────
+        def start_download():
+            urls    = album["urls"]
+            count   = album["count"]
+            est_mb  = album["est_mb"]
+            sz_str  = (str(round(est_mb/1024, 2)) + " GB") if est_mb > 1024 else (str(est_mb) + " MB")
+
+            if count == 0:
+                set_status("Check album info first.", RED)
+                return
+
+            save_dir = Path(save_dir_var.get().strip())
+            if not str(save_dir).strip():
+                set_status("Please choose a save folder.", RED)
+                return
+
+            # ── Confirmation dialog ──────────────────────────────────────────
+            confirmed = messagebox.askyesno(
+                "Confirm Download",
+                "You are about to download:\n\n"
+                "   Photos   :  " + str(count) + " images\n"
+                "   Est. size:  " + sz_str + "\n"
+                "   Save to  :  " + str(save_dir) + "\n\n"
+                "After download completes, face detection will\n"
+                "start automatically.\n\nProceed?",
+                parent=win
+            )
+            if not confirmed:
+                return
+
+            # Lock buttons
+            fetch_btn.config(state="disabled")
+            download_btn.config(state="disabled", text="Downloading...")
+
+            # Show progress bar
+            pbar.config(maximum=count, value=0, mode="determinate")
+            pbar.pack(fill=tk.X, pady=(4, 0))
+            pbar_lbl.config(text="Starting download...")
+            pbar_lbl.pack(anchor="w")
+            set_info("Downloading " + str(count) + " photos to:\n" + str(save_dir))
+
+            def run():
+                try:
+                    import requests
+                    headers = {
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                      "AppleWebKit/537.36 Chrome/120 Safari/537.36"
+                    }
+                    save_dir.mkdir(parents=True, exist_ok=True)
+                    total_bytes = 0
+                    n_saved     = 0
+
+                    for i, base_url in enumerate(urls):
+                        try:
+                            r = requests.get(base_url + "=d", headers=headers, timeout=30)
+                            r.raise_for_status()
+                            ct  = r.headers.get("Content-Type", "image/jpeg")
+                            ext = ".jpg" if "jpeg" in ct else ".png" if "png" in ct else ".jpg"
+                            out = save_dir / ("photo_" + str(i+1).zfill(4) + ext)
+                            out.write_bytes(r.content)
+                            self.db.add_image(str(out))
+                            total_bytes += len(r.content)
+                            n_saved     += 1
+                        except:
+                            pass
+
+                        done      = i + 1
+                        remaining = count - done
+                        mb_done   = round(total_bytes / 1024 / 1024, 1)
+
+                        def upd(d=done, rem=remaining, mb=mb_done):
+                            try:
+                                pbar["value"] = d
+                                pbar_lbl.config(text=(
+                                    str(d) + " / " + str(count) +
+                                    "   |   " + str(rem) + " remaining" +
+                                    "   |   " + str(mb) + " MB downloaded"
+                                ))
+                                set_status("Downloading photo " + str(d) + " of " + str(count) + "...", MUTED)
+                            except:
+                                pass
+
+                        self.root.after(0, upd)
+
+                    saved = n_saved
+                    self.root.after(0, lambda: self._gphoto_done(win, saved, auto_detect=True))
+
+                except Exception as e:
+                    err = str(e)[:100]
+                    self.root.after(0, lambda: set_status("Download error: " + err, RED))
+                    self.root.after(0, lambda: download_btn.config(
+                        state="normal", text="Download & Detect Faces"))
+
+            threading.Thread(target=run, daemon=True).start()
+
+        download_btn.config(command=start_download)
 
     def _scrape_google_photos_fallback(self, url, dest_dir):
         """
@@ -804,15 +974,21 @@ class App:
             self.status("Fallback scraping failed: " + str(e)[:60])
             return []
 
-    def _gphoto_done(self, win, count):
+    def _gphoto_done(self, win, count, auto_detect=False):
         try:
             win.destroy()
         except:
             pass
-        self.status("Downloaded " + str(count) + " photos from Google Photos. Click Detect Faces.")
-        messagebox.showinfo("Import Complete",
-                            "Successfully downloaded " + str(count) + " photos!\n\n"
-                            "Now click 'Detect Faces' to find faces in them.")
+        self.status("Downloaded " + str(count) + " photos from Google Photos.")
+        if auto_detect:
+            messagebox.showinfo("Download Complete",
+                                "Downloaded " + str(count) + " photos!\n\n"
+                                "Starting face detection now...")
+            self.detect_faces()
+        else:
+            messagebox.showinfo("Import Complete",
+                                "Downloaded " + str(count) + " photos!\n"
+                                "Click 'Detect Faces' to find faces.")
 
     # ── Detect Faces ──────────────────────────────────────────────────────────
     def detect_faces(self):
