@@ -165,50 +165,145 @@ class FaceEngine:
             self.log("ERROR: " + str(e))
             raise
 
-    def detect_and_encode(self, image_path):
-        results = []
+    # Backends tried in order — ssd and retinaface catch most real-world photos
+    BACKENDS = ["retinaface", "ssd", "opencv", "mtcnn"]
+
+    def _preprocess(self, image_path):
+        """
+        Load and preprocess image:
+        - Convert to RGB (handles PNG with alpha, EXIF rotation, etc.)
+        - Resize very large images to max 2000px for speed
+        Returns numpy array or None on failure.
+        """
+        import numpy as np
         try:
-            faces = self.DeepFace.represent(img_path=str(image_path),
-                model_name="Facenet", enforce_detection=True, detector_backend="opencv")
-            img = self.cv2.imread(str(image_path))
-            if img is None:
-                return results
-            h, w = img.shape[:2]
-            for i, fd in enumerate(faces):
-                emb = fd["embedding"]
-                reg = fd.get("facial_area", {})
-                x, y = reg.get("x", 0), reg.get("y", 0)
-                fw, fh = reg.get("w", 100), reg.get("h", 100)
-                p = 20
-                x1, y1 = max(0, x-p), max(0, y-p)
-                x2, y2 = min(w, x+fw+p), min(h, y+fh+p)
-                results.append((emb, img[y1:y2, x1:x2], i))
-        except Exception as e:
-            if "Face could not be detected" not in str(e):
-                self.log("SKIP " + Path(image_path).name + ": " + str(e))
+            pil_img = Image.open(image_path).convert("RGB")
+            # Apply EXIF rotation so portrait photos are upright
+            try:
+                from PIL import ExifTags
+                exif = pil_img._getexif()
+                if exif:
+                    for tag, val in exif.items():
+                        if ExifTags.TAGS.get(tag) == "Orientation":
+                            if val == 3:
+                                pil_img = pil_img.rotate(180, expand=True)
+                            elif val == 6:
+                                pil_img = pil_img.rotate(270, expand=True)
+                            elif val == 8:
+                                pil_img = pil_img.rotate(90, expand=True)
+                            break
+            except:
+                pass
+            # Downscale very large images
+            w, h = pil_img.size
+            if max(w, h) > 2000:
+                scale = 2000 / max(w, h)
+                pil_img = pil_img.resize((int(w*scale), int(h*scale)), Image.LANCZOS)
+            return np.array(pil_img)
+        except:
+            return None
+
+    def detect_and_encode(self, image_path):
+        """
+        Detect all faces in an image and return (embedding, crop, index) tuples.
+        Tries multiple detector backends so more faces are found.
+        Uses enforce_detection=False so it always returns something if a face-like
+        region exists — reduces missed detections on real-world photos.
+        """
+        results = []
+        img_array = self._preprocess(image_path)
+        if img_array is None:
+            self.log("SKIP (unreadable): " + Path(image_path).name)
+            return results
+
+        for backend in self.BACKENDS:
+            try:
+                faces = self.DeepFace.represent(
+                    img_path        = img_array,
+                    model_name      = "Facenet512",   # better accuracy than Facenet
+                    enforce_detection = False,         # don't skip if confidence is low
+                    detector_backend = backend,
+                    align            = True            # align face for better encoding
+                )
+                if not faces:
+                    continue
+                h, w = img_array.shape[:2]
+                seen_regions = []
+                for i, fd in enumerate(faces):
+                    emb = fd.get("embedding")
+                    if not emb:
+                        continue
+                    # Skip near-duplicate regions from multiple backends
+                    reg = fd.get("facial_area", {})
+                    x, y = reg.get("x", 0), reg.get("y", 0)
+                    fw, fh = reg.get("w", 80), reg.get("h", 80)
+                    # Ignore tiny detections (< 30px) — likely false positives
+                    if fw < 30 or fh < 30:
+                        continue
+                    # De-duplicate: skip if this region overlaps one we already have
+                    cx, cy = x + fw//2, y + fh//2
+                    duplicate = False
+                    for (ox, oy) in seen_regions:
+                        if abs(cx-ox) < 40 and abs(cy-oy) < 40:
+                            duplicate = True
+                            break
+                    if duplicate:
+                        continue
+                    seen_regions.append((cx, cy))
+                    # Crop with padding
+                    pad = 25
+                    x1 = max(0, x - pad)
+                    y1 = max(0, y - pad)
+                    x2 = min(w, x + fw + pad)
+                    y2 = min(h, y + fh + pad)
+                    crop = img_array[y1:y2, x1:x2]
+                    # Convert crop back to BGR for cv2.imwrite
+                    crop_bgr = self.cv2.cvtColor(crop, self.cv2.COLOR_RGB2BGR)
+                    results.append((emb, crop_bgr, len(results)))
+                if results:
+                    break   # stop trying other backends once we found faces
+            except Exception as e:
+                msg = str(e)
+                if "Face could not be detected" not in msg and "No face" not in msg:
+                    self.log("  [" + backend + "] " + Path(image_path).name + ": " + msg[:80])
+                continue
         return results
 
     def cluster_embeddings(self, embeddings, tolerance=0.45):
+        """
+        Cluster face embeddings using cosine similarity (better than L2 for face vectors).
+        Uses DBSCAN-style approach: a face joins a cluster if its cosine distance
+        to ANY existing member is below tolerance.
+        """
         import numpy as np
         if not embeddings:
             return []
-        arr = np.array(embeddings)
+
+        arr = np.array(embeddings, dtype=np.float32)
+
+        # L2-normalise so dot-product == cosine similarity
         norms = np.linalg.norm(arr, axis=1, keepdims=True)
-        norms[norms == 0] = 1
+        norms[norms == 0] = 1.0
         arr = arr / norms
-        n = len(arr)
+
+        n      = len(arr)
         labels = [-1] * n
-        cid = 0
+        cid    = 0
+
         for i in range(n):
             if labels[i] != -1:
                 continue
             labels[i] = cid
-            for j in range(i+1, n):
+            # Compare against all unassigned faces
+            for j in range(i + 1, n):
                 if labels[j] != -1:
                     continue
-                if float(np.linalg.norm(arr[i] - arr[j])) < tolerance:
+                # Cosine distance = 1 - dot product (since vectors are normalised)
+                cos_dist = 1.0 - float(np.dot(arr[i], arr[j]))
+                if cos_dist < tolerance:
                     labels[j] = cid
             cid += 1
+
         return labels
 
 
@@ -631,8 +726,12 @@ class App:
             messagebox.showinfo("No Faces", "No faces found. Run Detect Faces first.")
             return
         tol = simpledialog.askfloat("Tolerance",
-            "Enter tolerance:\n  0.3 = strict\n  0.45 = balanced (recommended)\n  0.6 = loose",
-            initialvalue=0.45, minvalue=0.1, maxvalue=1.0, parent=self.root)
+            "Enter clustering tolerance (cosine distance):\n"
+            "  0.25 = very strict  (safer, may create more clusters)\n"
+            "  0.35 = balanced     (recommended)\n"
+            "  0.50 = loose        (may mix different people)\n\n"
+            "Start with 0.35 and adjust if needed.",
+            initialvalue=0.35, minvalue=0.05, maxvalue=0.8, parent=self.root)
         if tol is None:
             return
         self.progress.start()
