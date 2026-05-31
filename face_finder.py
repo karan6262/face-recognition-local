@@ -119,10 +119,18 @@ class DB:
         return row["crop_path"] if row else None
 
     def get_images_for_cluster(self, cluster_id):
+        # Returns path + the crop_path of the first detected face in that image
         return self.conn.execute("""
-            SELECT DISTINCT i.path FROM faces f
-            JOIN images i ON f.image_id=i.id WHERE f.cluster_id=?
-        """, (cluster_id,)).fetchall()
+            SELECT i.path,
+                   (SELECT f2.crop_path FROM faces f2
+                    WHERE f2.image_id=i.id AND f2.cluster_id=?
+                    AND f2.crop_path!='' LIMIT 1) as face_crop
+            FROM faces f
+            JOIN images i ON f.image_id=i.id
+            WHERE f.cluster_id=?
+            GROUP BY i.path
+            ORDER BY i.id
+        """, (cluster_id, cluster_id)).fetchall()
 
     def get_stats(self):
         i = self.conn.execute("SELECT COUNT(*) FROM images WHERE scanned=1").fetchone()[0]
@@ -644,48 +652,95 @@ class App:
             browser = p.chromium.launch(headless=True)
             context = browser.new_context(
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                           "AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-                viewport={"width": 1280, "height": 900}
+                           "AppleWebKit/537.36 (KHTML, like Gecko) "
+                           "Chrome/124.0.0.0 Safari/537.36",
+                viewport={"width": 1440, "height": 900}
             )
             page = context.new_page()
 
+            # Intercept ALL network responses — grab every lh3 CDN URL
             def handle_response(response):
-                req_url = response.url
-                if "lh3.googleusercontent.com" in req_url:
-                    base = re.sub(r'=.*$', '', req_url)
-                    if len(base) > 50:
-                        image_urls.add(base)
+                try:
+                    req_url = response.url
+                    if "lh3.googleusercontent.com" in req_url:
+                        base = re.sub(r'[=?].*$', '', req_url)
+                        if len(base) > 55:
+                            image_urls.add(base)
+                except:
+                    pass
 
             page.on("response", handle_response)
+
             log_fn("Loading album page...")
-            page.goto(url, wait_until="networkidle", timeout=30000)
-            time.sleep(2)
-
-            log_fn("Scrolling to load all photos...")
-            prev_count = 0
-            for _ in range(80):
-                page.keyboard.press("End")
-                page.mouse.wheel(0, 3000)
-                time.sleep(0.8)
-                curr_count = len(image_urls)
-                if curr_count == prev_count:
-                    break
-                prev_count = curr_count
-                if curr_count > 0 and curr_count % 20 == 0:
-                    log_fn("Found " + str(curr_count) + " photos so far...")
-
             try:
-                srcs = page.eval_on_selector_all(
-                    "img[src*='lh3.googleusercontent.com']",
-                    "els => els.map(e => e.src)"
+                page.goto(url, wait_until="networkidle", timeout=45000)
+            except:
+                # timeout is ok — page may still have content
+                pass
+            time.sleep(3)
+
+            # ── Smart infinite scroll ──────────────────────────────────────
+            # Stop only after 5 consecutive scroll rounds with zero new images
+            log_fn("Scrolling to load all photos...")
+            no_new_count = 0
+            max_no_new   = 5          # how many rounds of no new images before stopping
+            round_num    = 0
+            max_rounds   = 300        # safety cap (~1000 photos at ~3-4 per round)
+
+            while no_new_count < max_no_new and round_num < max_rounds:
+                before = len(image_urls)
+
+                # Scroll to absolute bottom
+                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                time.sleep(0.5)
+                page.keyboard.press("End")
+                time.sleep(0.5)
+
+                # Also grab any visible img src tags directly from DOM
+                try:
+                    srcs = page.eval_on_selector_all(
+                        "img[src*='lh3.googleusercontent.com']",
+                        "els => els.map(e => e.src)"
+                    )
+                    for src in srcs:
+                        base = re.sub(r'[=?].*$', '', src)
+                        if len(base) > 55:
+                            image_urls.add(base)
+                except:
+                    pass
+
+                # Wait for network to settle after lazy-load triggers
+                try:
+                    page.wait_for_load_state("networkidle", timeout=3000)
+                except:
+                    pass
+
+                after = len(image_urls)
+                if after == before:
+                    no_new_count += 1
+                else:
+                    no_new_count = 0   # reset — we found new ones
+
+                round_num += 1
+                if after > 0 and after % 10 == 0:
+                    log_fn("Found " + str(after) + " photos so far, still scrolling...")
+
+            # Final DOM scrape after scrolling completes
+            try:
+                all_imgs = page.eval_on_selector_all(
+                    "img[src*='lh3.googleusercontent.com'], "
+                    "img[data-src*='lh3.googleusercontent.com']",
+                    "els => els.map(e => e.src || e.getAttribute('data-src'))"
                 )
-                for src in srcs:
-                    base = re.sub(r'=.*$', '', src)
-                    if len(base) > 50:
-                        image_urls.add(base)
+                for src in all_imgs:
+                    if src:
+                        base = re.sub(r'[=?].*$', '', src)
+                        if len(base) > 55:
+                            image_urls.add(base)
             except:
                 pass
 
+            log_fn("Finished scrolling. Total photos found: " + str(len(image_urls)))
             browser.close()
 
         return list(image_urls)
@@ -1426,33 +1481,77 @@ class App:
         rows = self.db.get_images_for_cluster(cluster_id)
         if not rows:
             tk.Label(self.grid_frame, text="No photos found for this cluster.",
-                     bg=BG, fg=MUTED, font=("Segoe UI", 10)).grid(row=0, column=0, padx=30, pady=40)
+                     bg=BG, fg=MUTED, font=("Segoe UI", 10)).grid(
+                row=0, column=0, padx=30, pady=40)
             return
 
-        COLS  = 5
-        THUMB = 200
+        COLS     = 5
+        THUMB    = 200
+        FACE_SZ  = 56    # face crop thumbnail size in corner
+
         for idx, row in enumerate(rows):
-            path = row["path"]
+            path      = row["path"]
+            face_crop = row["face_crop"] if row["face_crop"] else None
             r, c = divmod(idx, COLS)
+
+            # Outer card
             card = tk.Frame(self.grid_frame, bg=CARD, padx=4, pady=4)
             card.grid(row=r, column=c, padx=8, pady=8)
+
+            # ── Main photo thumbnail ────────────────────────────────────────
             try:
-                img   = Image.open(path)
+                img = Image.open(path)
                 img.thumbnail((THUMB, THUMB))
                 photo = ImageTk.PhotoImage(img)
                 self.photo_cache[path] = photo
-                btn = tk.Button(card, image=photo, bg=CARD,
-                                activebackground=BTN_HOV, relief="flat",
-                                cursor="hand2", bd=0,
-                                command=lambda p=path: self._open_file(p))
-                btn.pack()
+
+                # Canvas so we can overlay the face badge on top
+                canv = tk.Canvas(card, width=photo.width(), height=photo.height(),
+                                 bg=CARD, highlightthickness=0, cursor="hand2")
+                canv.pack()
+                canv.create_image(0, 0, anchor="nw", image=photo)
+                canv.bind("<Button-1>", lambda e, p=path: self._open_file(p))
+
+                # ── Face crop badge — top-right corner ──────────────────────
+                if face_crop and Path(face_crop).exists():
+                    try:
+                        fc_img = Image.open(face_crop).resize(
+                            (FACE_SZ, FACE_SZ), Image.LANCZOS)
+
+                        # Add a coloured ring border so it stands out
+                        bordered = Image.new("RGB",
+                                            (FACE_SZ + 4, FACE_SZ + 4), ACCENT2)
+                        bordered.paste(fc_img, (2, 2))
+                        fc_photo = ImageTk.PhotoImage(bordered)
+                        # Keep reference alive on the canvas itself
+                        canv._face_photo = fc_photo
+                        # Place badge top-right, with 4px margin
+                        bx = photo.width() - (FACE_SZ + 4) - 4
+                        canv.create_image(bx, 4, anchor="nw", image=fc_photo)
+
+                        # Tooltip-style label under the badge
+                        canv.create_rectangle(
+                            bx - 2, FACE_SZ + 8,
+                            bx + (FACE_SZ + 6), FACE_SZ + 22,
+                            fill=ACCENT2, outline=""
+                        )
+                        canv.create_text(
+                            bx + (FACE_SZ // 2) + 2, FACE_SZ + 15,
+                            text="face", fill="#fffdf9",
+                            font=("Segoe UI", 7, "bold")
+                        )
+                    except:
+                        pass
             except:
-                tk.Label(card, text="Error", bg=CARD, fg=RED).pack()
+                tk.Label(card, text="Error loading", bg=CARD, fg=RED).pack()
+
+            # ── Filename label ──────────────────────────────────────────────
             fname = Path(path).name
             if len(fname) > 22:
                 fname = fname[:20] + "..."
             tk.Label(card, text=fname, bg=CARD, fg=MUTED,
                      font=("Segoe UI", 8)).pack()
+
         self.status("Showing " + str(len(rows)) + " photos for " + label)
 
 
