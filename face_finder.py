@@ -725,7 +725,32 @@ class App:
             win.update_idletasks()
 
         # ────────────────────────────────────────────────────────────────────
-        # STEP 1 — CHECK ALBUM INFO (no download yet)
+        # Helper: install gallery-dl once
+        # ────────────────────────────────────────────────────────────────────
+        def ensure_gallery_dl():
+            """Install gallery-dl if not present. Returns True on success."""
+            try:
+                result = subprocess.run(
+                    [sys.executable, "-m", "gallery_dl", "--version"],
+                    capture_output=True, timeout=15
+                )
+                return result.returncode == 0
+            except:
+                pass
+            try:
+                self.root.after(0, lambda: set_status("Installing gallery-dl (one time)...", YELLOW))
+                subprocess.check_call(
+                    [sys.executable, "-m", "pip", "install", "gallery-dl", "--quiet"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120
+                )
+                return True
+            except:
+                return False
+
+        # ────────────────────────────────────────────────────────────────────
+        # STEP 1 — CHECK ALBUM INFO using gallery-dl --dump-json (no download)
+        # gallery-dl is the ONLY reliable way to get Google Photos album info
+        # because the page is JS-rendered — requests.get() returns empty HTML
         # ────────────────────────────────────────────────────────────────────
         def check_album():
             url = url_var.get().strip()
@@ -739,80 +764,85 @@ class App:
             fetch_btn.config(state="disabled", text="Checking...")
             download_btn.config(state="disabled")
             set_info("Connecting to album, please wait...")
-            set_status("")
+            set_status("Google Photos uses JavaScript — using gallery-dl to read album...", MUTED)
             pbar.pack_forget()
             pbar_lbl.pack_forget()
 
             def run():
                 try:
-                    try:
-                        import requests
-                    except ImportError:
-                        set_status("Installing requests...", YELLOW)
-                        subprocess.check_call(
-                            [sys.executable, "-m", "pip", "install",
-                             "requests", "beautifulsoup4", "--quiet"],
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                        import requests
-
-                    headers = {
-                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                                      "AppleWebKit/537.36 (KHTML, like Gecko) "
-                                      "Chrome/120.0.0.0 Safari/537.36"
-                    }
-                    resp = requests.get(url, headers=headers, timeout=30)
-                    resp.raise_for_status()
-
-                    # Extract Google Photos CDN URLs from page source
-                    raw = re.findall(
-                        r'https://lh3\.googleusercontent\.com/[A-Za-z0-9_\-]+'
-                        r'(?:=[A-Za-z0-9_\-\.]+)*',
-                        resp.text
-                    )
-                    seen, clean = set(), []
-                    for u in raw:
-                        base = re.sub(r'=.*$', '', u)
-                        if base not in seen and len(base) > 60:
-                            seen.add(base)
-                            clean.append(base)
-
-                    count   = len(clean)
-                    est_mb  = round(count * 3.5, 1)
-                    est_gb  = round(est_mb / 1024, 2)
-                    sz_str  = (str(est_gb) + " GB") if est_mb > 1024 else (str(est_mb) + " MB")
-
-                    album["urls"]   = clean
-                    album["count"]  = count
-                    album["est_mb"] = est_mb
-
-                    if count == 0:
-                        self.root.after(0, lambda: set_info(
-                            "No photos found in this album.\n"
-                            "Album may be private or require login."))
+                    if not ensure_gallery_dl():
                         self.root.after(0, lambda: set_status(
-                            "Check album privacy settings.", RED))
+                            "gallery-dl install failed. Check your internet connection.", RED))
                         self.root.after(0, lambda: fetch_btn.config(
                             state="normal", text="Check Album"))
                         return
 
+                    # Use gallery-dl --dump-json to list URLs without downloading
+                    self.root.after(0, lambda: set_status("Fetching album contents...", MUTED))
+                    result = subprocess.run(
+                        [sys.executable, "-m", "gallery_dl",
+                         "--dump-json",      # list files without downloading
+                         "--no-download",
+                         url],
+                        capture_output=True, text=True, timeout=60
+                    )
+
+                    lines = [l.strip() for l in result.stdout.splitlines() if l.strip()]
+                    # gallery-dl outputs JSON lines — count image entries
+                    count = sum(1 for l in lines if '"url"' in l or l.startswith("http"))
+
+                    # Fallback: count lines that look like image paths
+                    if count == 0:
+                        count = sum(1 for l in lines if any(
+                            ext in l.lower() for ext in [".jpg", ".jpeg", ".png", ".webp"]
+                        ))
+
+                    # If still 0, try a simpler line count of stdout
+                    if count == 0 and lines:
+                        count = len(lines)
+
+                    album["count"] = count
+
+                    if count == 0:
+                        err_out = (result.stderr or "")[:300]
+                        hint = ""
+                        if "403" in err_out or "unauthorized" in err_out.lower():
+                            hint = "Album is set to private. Set it to 'Anyone with link can view'."
+                        elif "404" in err_out:
+                            hint = "Album not found. Check the URL is correct."
+                        else:
+                            hint = "Could not read album. Make sure it is a public shared album."
+                        self.root.after(0, lambda h=hint: set_info(
+                            "No photos found.\n\n" + h))
+                        self.root.after(0, lambda: set_status("", RED))
+                        self.root.after(0, lambda: fetch_btn.config(
+                            state="normal", text="Check Album"))
+                        return
+
+                    est_mb = round(count * 3.5, 1)
+                    sz_str = (str(round(est_mb/1024, 2)) + " GB") if est_mb > 1024 else (str(est_mb) + " MB")
+                    album["est_mb"] = est_mb
+
                     msg = (
                         "Album found!\n\n"
                         "   Photos found    :  " + str(count) + " images\n"
-                        "   Estimated size  :  " + sz_str +
-                        "  (approx. " + str(round(count * 3.5)) + " MB at ~3.5 MB/photo)\n"
+                        "   Estimated size  :  " + sz_str + "  (~3.5 MB per photo)\n"
                         "   Save location   :  " + save_dir_var.get()
                     )
                     self.root.after(0, lambda: set_info(msg))
                     self.root.after(0, lambda: set_status(
-                        "Ready to download. Click 'Download & Detect Faces' to proceed.", GREEN))
+                        "Ready. Click 'Download & Detect Faces' to proceed.", GREEN))
                     self.root.after(0, lambda: download_btn.config(state="normal"))
                     self.root.after(0, lambda: fetch_btn.config(
                         state="normal", text="Re-Check"))
 
+                except subprocess.TimeoutExpired:
+                    self.root.after(0, lambda: set_status(
+                        "Timeout connecting to album. Check your internet.", RED))
+                    self.root.after(0, lambda: fetch_btn.config(
+                        state="normal", text="Check Album"))
                 except Exception as e:
-                    err = str(e)[:100]
-                    self.root.after(0, lambda: set_info(""))
-                    self.root.after(0, lambda: set_status("Error: " + err, RED))
+                    self.root.after(0, lambda: set_status("Error: " + str(e)[:100], RED))
                     self.root.after(0, lambda: fetch_btn.config(
                         state="normal", text="Check Album"))
 
@@ -821,96 +851,99 @@ class App:
         fetch_btn.config(command=check_album)
 
         # ────────────────────────────────────────────────────────────────────
-        # STEP 2 — DOWNLOAD WITH LIVE PROGRESS + AUTO DETECT
+        # STEP 2 — DOWNLOAD with gallery-dl + live file-count progress + auto detect
         # ────────────────────────────────────────────────────────────────────
         def start_download():
-            urls    = album["urls"]
-            count   = album["count"]
-            est_mb  = album["est_mb"]
-            sz_str  = (str(round(est_mb/1024, 2)) + " GB") if est_mb > 1024 else (str(est_mb) + " MB")
+            count  = album["count"]
+            est_mb = album["est_mb"]
+            sz_str = (str(round(est_mb/1024, 2)) + " GB") if est_mb > 1024 else (str(est_mb) + " MB")
 
             if count == 0:
-                set_status("Check album info first.", RED)
+                set_status("Click 'Check Album' first.", RED)
                 return
 
+            url      = url_var.get().strip()
             save_dir = Path(save_dir_var.get().strip())
-            if not str(save_dir).strip():
-                set_status("Please choose a save folder.", RED)
-                return
 
             # ── Confirmation dialog ──────────────────────────────────────────
             confirmed = messagebox.askyesno(
                 "Confirm Download",
                 "You are about to download:\n\n"
-                "   Photos   :  " + str(count) + " images\n"
-                "   Est. size:  " + sz_str + "\n"
-                "   Save to  :  " + str(save_dir) + "\n\n"
-                "After download completes, face detection will\n"
-                "start automatically.\n\nProceed?",
+                "   Photos    :  " + str(count) + " images\n"
+                "   Est. size :  " + sz_str + "\n"
+                "   Save to   :  " + str(save_dir) + "\n\n"
+                "Face detection will start automatically\n"
+                "after download completes.\n\nProceed?",
                 parent=win
             )
             if not confirmed:
                 return
 
-            # Lock buttons
+            save_dir.mkdir(parents=True, exist_ok=True)
             fetch_btn.config(state="disabled")
             download_btn.config(state="disabled", text="Downloading...")
 
-            # Show progress bar
-            pbar.config(maximum=count, value=0, mode="determinate")
+            pbar.config(maximum=max(count, 1), value=0, mode="determinate")
             pbar.pack(fill=tk.X, pady=(4, 0))
-            pbar_lbl.config(text="Starting download...")
+            pbar_lbl.config(text="Starting gallery-dl download...")
             pbar_lbl.pack(anchor="w")
-            set_info("Downloading " + str(count) + " photos to:\n" + str(save_dir))
+            set_info("Downloading photos to:\n" + str(save_dir))
 
             def run():
                 try:
-                    import requests
-                    headers = {
-                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                                      "AppleWebKit/537.36 Chrome/120 Safari/537.36"
-                    }
-                    save_dir.mkdir(parents=True, exist_ok=True)
-                    total_bytes = 0
-                    n_saved     = 0
+                    # Run gallery-dl — it downloads directly, no auth needed for public albums
+                    proc = subprocess.Popen(
+                        [sys.executable, "-m", "gallery_dl",
+                         "--dest",     str(save_dir),
+                         "--no-mtime",
+                         url],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True
+                    )
 
-                    for i, base_url in enumerate(urls):
-                        try:
-                            r = requests.get(base_url + "=d", headers=headers, timeout=30)
-                            r.raise_for_status()
-                            ct  = r.headers.get("Content-Type", "image/jpeg")
-                            ext = ".jpg" if "jpeg" in ct else ".png" if "png" in ct else ".jpg"
-                            out = save_dir / ("photo_" + str(i+1).zfill(4) + ext)
-                            out.write_bytes(r.content)
-                            self.db.add_image(str(out))
-                            total_bytes += len(r.content)
-                            n_saved     += 1
-                        except:
-                            pass
+                    downloaded = 0
+                    for line in proc.stdout:
+                        line = line.strip()
+                        # gallery-dl prints a line for each downloaded file
+                        if line and ("Downloading" in line or ".jpg" in line.lower()
+                                     or ".jpeg" in line.lower() or ".png" in line.lower()):
+                            downloaded += 1
+                            done = downloaded
+                            rem  = max(0, count - done)
+                            def upd(d=done, r=rem):
+                                try:
+                                    pbar["value"] = d
+                                    pbar_lbl.config(text=(
+                                        str(d) + " downloaded"
+                                        + ("   |   " + str(r) + " remaining" if r > 0 else "   |   Done!")
+                                    ))
+                                    set_status("Downloading... " + str(d) + " photos saved.", MUTED)
+                                except:
+                                    pass
+                            self.root.after(0, upd)
 
-                        done      = i + 1
-                        remaining = count - done
-                        mb_done   = round(total_bytes / 1024 / 1024, 1)
+                    proc.wait()
 
-                        def upd(d=done, rem=remaining, mb=mb_done):
-                            try:
-                                pbar["value"] = d
-                                pbar_lbl.config(text=(
-                                    str(d) + " / " + str(count) +
-                                    "   |   " + str(rem) + " remaining" +
-                                    "   |   " + str(mb) + " MB downloaded"
-                                ))
-                                set_status("Downloading photo " + str(d) + " of " + str(count) + "...", MUTED)
-                            except:
-                                pass
+                    # Count what was actually saved
+                    saved_files = [f for f in save_dir.rglob("*")
+                                   if f.is_file() and f.suffix.lower() in SUPPORTED]
 
-                        self.root.after(0, upd)
+                    if not saved_files:
+                        self.root.after(0, lambda: set_status(
+                            "No files saved. gallery-dl may have failed.", RED))
+                        self.root.after(0, lambda: download_btn.config(
+                            state="normal", text="Download & Detect Faces"))
+                        return
 
-                    saved = n_saved
-                    self.root.after(0, lambda: self._gphoto_done(win, saved, auto_detect=True))
+                    for f in saved_files:
+                        self.db.add_image(str(f))
+
+                    n = len(saved_files)
+                    self.root.after(0, lambda: self._gphoto_done(win, n, auto_detect=True))
 
                 except Exception as e:
-                    err = str(e)[:100]
+                    err = str(e)[:120]
                     self.root.after(0, lambda: set_status("Download error: " + err, RED))
                     self.root.after(0, lambda: download_btn.config(
                         state="normal", text="Download & Detect Faces"))
