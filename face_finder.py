@@ -215,46 +215,75 @@ class FaceEngine:
 
 # ─── Cluster Card (Canvas-based row with real face thumbnail) ─────────────────
 class ClusterCard(tk.Frame):
-    """A single row in the cluster sidebar showing a real face thumbnail."""
+    """A single row in the cluster sidebar showing a real face thumbnail.
+    - Single click  → select and show photos
+    - Ctrl+Click    → toggle multi-select for merge (blue border highlight)
+    - Double-click  → select and open label dialog
+    """
     THUMB = 48
 
     def __init__(self, parent, cluster_id, name, photo_count, face_img,
-                 is_named, on_click, on_double):
+                 is_named, on_click, on_ctrl_click, on_double):
         super().__init__(parent, bg=CARD, cursor="hand2", pady=4)
-        self.cluster_id = cluster_id
-        self.on_click   = on_click
-        self.selected   = False
+        self.cluster_id    = cluster_id
+        self.selected      = False   # normal single-click selection (blue bg)
+        self.ctrl_selected = False   # ctrl-click multi-select (purple border)
 
         # face thumbnail canvas
-        canvas = tk.Canvas(self, width=self.THUMB, height=self.THUMB,
-                           bg=CARD, highlightthickness=0)
-        canvas.pack(side=tk.LEFT, padx=(6, 4))
+        self._canvas = tk.Canvas(self, width=self.THUMB, height=self.THUMB,
+                                 bg=CARD, highlightthickness=0)
+        self._canvas.pack(side=tk.LEFT, padx=(6, 4))
         if face_img:
-            canvas.create_image(0, 0, anchor="nw", image=face_img)
-            canvas.image = face_img
+            self._canvas.create_image(0, 0, anchor="nw", image=face_img)
+            self._canvas.image = face_img
         else:
-            canvas.create_oval(4, 4, self.THUMB-4, self.THUMB-4,
-                               fill=BORDER, outline=MUTED, width=2)
-            canvas.create_text(self.THUMB//2, self.THUMB//2,
-                               text="?", fill=MUTED, font=("Segoe UI", 16, "bold"))
+            self._canvas.create_oval(4, 4, self.THUMB-4, self.THUMB-4,
+                                     fill=BORDER, outline=MUTED, width=2)
+            self._canvas.create_text(self.THUMB//2, self.THUMB//2,
+                                     text="?", fill=MUTED, font=("Segoe UI", 16, "bold"))
 
         # text block
-        txt = tk.Frame(self, bg=CARD)
-        txt.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self._txt = tk.Frame(self, bg=CARD)
+        self._txt.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         color = GREEN if is_named else TEXT
-        tk.Label(txt, text=name, bg=CARD, fg=color,
-                 font=("Segoe UI", 10, "bold"), anchor="w").pack(fill=tk.X)
-        tk.Label(txt, text=str(photo_count) + " photos", bg=CARD, fg=MUTED,
-                 font=("Segoe UI", 8), anchor="w").pack(fill=tk.X)
+        self._name_lbl = tk.Label(self._txt, text=name, bg=CARD, fg=color,
+                                  font=("Segoe UI", 10, "bold"), anchor="w")
+        self._name_lbl.pack(fill=tk.X)
+        self._count_lbl = tk.Label(self._txt, text=str(photo_count) + " photos",
+                                   bg=CARD, fg=MUTED, font=("Segoe UI", 8), anchor="w")
+        self._count_lbl.pack(fill=tk.X)
 
-        # bind clicks on all child widgets
-        for w in [self, canvas, txt] + list(txt.winfo_children()):
-            w.bind("<Button-1>", lambda e: on_click(cluster_id))
-            w.bind("<Double-Button-1>", lambda e: on_double(cluster_id))
+        # ctrl-select badge label (hidden by default)
+        self._badge = tk.Label(self, text="✓", bg=ACCENT2, fg=BG,
+                               font=("Segoe UI", 9, "bold"), padx=4)
 
+        # bind clicks on every child widget
+        for w in [self, self._canvas, self._txt, self._name_lbl, self._count_lbl]:
+            w.bind("<Button-1>",         lambda e, ci=cluster_id: on_click(ci))
+            w.bind("<Control-Button-1>", lambda e, ci=cluster_id: on_ctrl_click(ci))
+            w.bind("<Double-Button-1>",  lambda e, ci=cluster_id: on_double(ci))
+
+    # normal single-click highlight (blue)
     def set_selected(self, val):
         self.selected = val
-        bg = BTN_HOV if val else CARD
+        self._refresh_bg()
+
+    # ctrl-click multi-select highlight (purple accent)
+    def set_ctrl_selected(self, val):
+        self.ctrl_selected = val
+        if val:
+            self._badge.place(relx=1.0, rely=0.0, anchor="ne", x=-4, y=4)
+        else:
+            self._badge.place_forget()
+        self._refresh_bg()
+
+    def _refresh_bg(self):
+        if self.ctrl_selected:
+            bg = "#2e2a45"           # dark purple tint for multi-select
+        elif self.selected:
+            bg = BTN_HOV             # blue tint for single select
+        else:
+            bg = CARD
         self._set_bg_recursive(self, bg)
 
     def _set_bg_recursive(self, widget, bg):
@@ -263,7 +292,8 @@ class ClusterCard(tk.Frame):
         except:
             pass
         for child in widget.winfo_children():
-            self._set_bg_recursive(child, bg)
+            if child is not self._badge:
+                self._set_bg_recursive(child, bg)
 
 
 
@@ -661,14 +691,15 @@ class App:
                 continue
             photo = self._get_face_thumb(cid)
             card  = ClusterCard(
-                parent      = self.cluster_list_frame,
-                cluster_id  = cid,
-                name        = name,
-                photo_count = row["photo_count"],
-                face_img    = photo,
-                is_named    = bool(row["person_name"]),
-                on_click    = self._on_cluster_click,
-                on_double   = self._on_cluster_double
+                parent        = self.cluster_list_frame,
+                cluster_id    = cid,
+                name          = name,
+                photo_count   = row["photo_count"],
+                face_img      = photo,
+                is_named      = bool(row["person_name"]),
+                on_click      = self._on_cluster_click,
+                on_ctrl_click = self._on_cluster_ctrl_click,
+                on_double     = self._on_cluster_double
             )
             card.pack(fill=tk.X, padx=4, pady=2)
             # separator
@@ -680,13 +711,27 @@ class App:
             self.cluster_cards[self.selected_cluster].set_selected(True)
 
     def _on_cluster_click(self, cluster_id):
-        # Deselect previous
+        # Deselect previous normal selection
         if self.selected_cluster and self.selected_cluster in self.cluster_cards:
             self.cluster_cards[self.selected_cluster].set_selected(False)
         self.selected_cluster = cluster_id
         if cluster_id in self.cluster_cards:
             self.cluster_cards[cluster_id].set_selected(True)
         self._show_cluster_photos(cluster_id)
+
+    def _on_cluster_ctrl_click(self, cluster_id):
+        """Toggle ctrl-click multi-select for merge — does NOT change photo panel."""
+        card = self.cluster_cards.get(cluster_id)
+        if card is None:
+            return
+        # toggle
+        new_state = not card.ctrl_selected
+        card.set_ctrl_selected(new_state)
+        count = sum(1 for c in self.cluster_cards.values() if c.ctrl_selected)
+        if count > 0:
+            self.status(str(count) + " clusters selected for merge. Click 'Merge Selected'.")
+        else:
+            self.status("Ready.")
 
     def _on_cluster_double(self, cluster_id):
         self._on_cluster_click(cluster_id)
@@ -778,17 +823,18 @@ class App:
         self.status("Exported " + str(count) + " photos.")
 
     def merge_selected(self):
-        selected_ids = [cid for cid, card in self.cluster_cards.items() if card.selected]
+        selected_ids = [cid for cid, card in self.cluster_cards.items() if card.ctrl_selected]
         if len(selected_ids) < 2:
             messagebox.showwarning("Select More",
-                "Click at least 2 clusters while holding Ctrl to select,\n"
-                "then click Merge Selected.\n\nTip: Use the Merge Clusters button in toolbar for easier selection.")
+                "Ctrl+Click at least 2 cluster cards to select them\n"
+                "(they turn purple with a checkmark),\nthen click Merge Selected.\n\n"
+                "Or use the Merge Clusters button in the toolbar.")
             return
         names = []
         for cid in selected_ids:
             row = self.db.conn.execute("SELECT person_name FROM clusters WHERE id=?", (cid,)).fetchone()
             names.append(row["person_name"] if row and row["person_name"] else "Cluster " + str(cid))
-        if not messagebox.askyesno("Merge", "Merge these clusters?\n\n" + "\n".join(names)):
+        if not messagebox.askyesno("Merge", "Merge " + str(len(selected_ids)) + " clusters?\n\n" + "\n".join(names)):
             return
         keep = selected_ids[0]
         for mid in selected_ids[1:]:
@@ -796,7 +842,7 @@ class App:
         self.face_thumb_cache.clear()
         self.selected_cluster = keep
         self.refresh_cluster_list()
-        messagebox.showinfo("Done", "Merged " + str(len(selected_ids)) + " clusters!")
+        messagebox.showinfo("Done", "Merged " + str(len(selected_ids)) + " clusters successfully!")
         self.status("Merged " + str(len(selected_ids)) + " clusters.")
 
     def merge_clusters_popup(self):
