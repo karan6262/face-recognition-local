@@ -609,111 +609,471 @@ class App:
         self.status("Found " + str(count) + " images. Click Detect Faces.")
         messagebox.showinfo("Scan Complete", "Found " + str(count) + " images.\nNow click Detect Faces.")
 
-    # ── Import from Google Photos Shared Album ────────────────────────────────
+    # ── Google Photos OAuth helpers ───────────────────────────────────────────
+    GPHOTO_TOKEN = DATA_DIR / "gphoto_token.json"
+    GPHOTO_SCOPES = ["https://www.googleapis.com/auth/photoslibrary.readonly"]
+
+    def _gphoto_install_deps(self, log_fn):
+        """Install google-auth packages if missing. Returns True on success."""
+        import subprocess, sys
+        pkgs = [
+            "google-auth", "google-auth-oauthlib",
+            "google-auth-httplib2", "requests"
+        ]
+        missing = []
+        for pkg in pkgs:
+            try:
+                __import__(pkg.replace("-", "_").split(".")[0])
+            except ImportError:
+                missing.append(pkg)
+        if missing:
+            log_fn("Installing: " + ", ".join(missing) + "...")
+            try:
+                subprocess.check_call(
+                    [sys.executable, "-m", "pip", "install"] + missing + ["--quiet"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120
+                )
+            except Exception as e:
+                log_fn("Install failed: " + str(e))
+                return False
+        return True
+
+    def _gphoto_get_credentials(self, client_secret_path, log_fn):
+        """
+        Run OAuth flow. Opens browser for user consent.
+        Returns credentials or None on failure.
+        Saves token to disk so user only logs in once.
+        """
+        from google_auth_oauthlib.flow import InstalledAppFlow
+        from google.auth.transport.requests import Request
+        from google.oauth2.credentials import Credentials
+        import json
+
+        creds = None
+
+        # Load saved token if it exists
+        if self.GPHOTO_TOKEN.exists():
+            try:
+                creds = Credentials.from_authorized_user_file(
+                    str(self.GPHOTO_TOKEN), self.GPHOTO_SCOPES)
+            except:
+                creds = None
+
+        # Refresh if expired
+        if creds and creds.expired and creds.refresh_token:
+            try:
+                creds.refresh(Request())
+            except:
+                creds = None
+
+        # Full OAuth flow if no valid credentials
+        if not creds or not creds.valid:
+            log_fn("Opening browser for Google sign-in...")
+            flow = InstalledAppFlow.from_client_secrets_file(
+                client_secret_path, self.GPHOTO_SCOPES)
+            # run_local_server opens browser and waits for redirect
+            creds = flow.run_local_server(port=0, open_browser=True)
+            # Save token for next time
+            self.GPHOTO_TOKEN.write_text(creds.to_json())
+            log_fn("Login successful! Token saved.")
+
+        return creds
+
+    def _gphoto_list_album_items(self, creds, album_id_or_url, log_fn):
+        """
+        List all media items in a shared album using the Google Photos REST API.
+        Returns list of (filename, download_url) tuples.
+        """
+        import requests as req_lib
+
+        headers = {"Authorization": "Bearer " + creds.token}
+        base_url = "https://photoslibrary.googleapis.com/v1"
+
+        # If user passed a full URL, try to extract album ID from it
+        # Shared album URL format: photos.google.com/album/<ALBUM_ID>
+        import re
+        album_id = None
+        match = re.search(r'/album/([A-Za-z0-9_\-]+)', album_id_or_url)
+        if match:
+            album_id = match.group(1)
+
+        items = []
+
+        if album_id:
+            # Search mediaItems by albumId
+            log_fn("Fetching photos from album...")
+            page_token = None
+            while True:
+                body = {"albumId": album_id, "pageSize": 100}
+                if page_token:
+                    body["pageToken"] = page_token
+                resp = req_lib.post(
+                    base_url + "/mediaItems:search",
+                    headers=headers, json=body, timeout=30
+                )
+                if resp.status_code != 200:
+                    log_fn("API error " + str(resp.status_code) + ": " + resp.text[:100])
+                    break
+                data = resp.json()
+                for item in data.get("mediaItems", []):
+                    filename = item.get("filename", "photo.jpg")
+                    # =d suffix downloads full-res
+                    dl_url = item.get("baseUrl", "") + "=d"
+                    items.append((filename, dl_url))
+                page_token = data.get("nextPageToken")
+                if not page_token:
+                    break
+        else:
+            # Fallback: list all photos in the user's library
+            log_fn("No album ID found in URL — listing recent photos from your library...")
+            page_token = None
+            while True:
+                params = {"pageSize": 100}
+                if page_token:
+                    params["pageToken"] = page_token
+                resp = req_lib.get(
+                    base_url + "/mediaItems",
+                    headers=headers, params=params, timeout=30
+                )
+                if resp.status_code != 200:
+                    break
+                data = resp.json()
+                for item in data.get("mediaItems", []):
+                    filename = item.get("filename", "photo.jpg")
+                    dl_url = item.get("baseUrl", "") + "=d"
+                    items.append((filename, dl_url))
+                page_token = data.get("nextPageToken")
+                if not page_token or len(items) >= 500:
+                    break
+
+        return items
+
+    # ── Import from Google Photos — Main Dialog ───────────────────────────────
     def import_google_photos(self):
         """
-        Full flow:
-        Step 1 - User pastes URL and picks save folder
-        Step 2 - App fetches album info (photo count + estimated size)
-        Step 3 - Confirmation dialog shows details before any download
-        Step 4 - Downloads with live per-photo progress bar
-        Step 5 - Auto-starts face detection after download
+        Full OAuth2 flow for Google Photos:
+        Step 1 - User picks client_secret.json + save folder + album URL
+        Step 2 - Browser opens for Google sign-in (one time only)
+        Step 3 - Fetch album info (photo count + estimated size)
+        Step 4 - Confirmation dialog
+        Step 5 - Download with live progress
+        Step 6 - Auto-start face detection
         """
-        import subprocess, sys, re
+        import subprocess, sys
 
         win = tk.Toplevel(self.root)
         win.title("Import from Google Photos")
-        win.geometry("600x440")
+        win.geometry("640x560")
         win.resizable(False, False)
         win.configure(bg=BG2)
         win.grab_set()
 
-        # ── Header ──────────────────────────────────────────────────────────
-        tk.Label(win, text="Import Google Photos Album",
-                 bg=BG2, fg=ACCENT, font=("Segoe UI", 14, "bold")).pack(pady=(18, 2))
-        tk.Label(win, text="Paste a PUBLIC shared album link  (Anyone with link can view)",
-                 bg=BG2, fg=MUTED, font=("Segoe UI", 9)).pack(pady=(0, 10))
+        # ── Header ───────────────────────────────────────────────────────────
+        tk.Label(win, text="Import from Google Photos",
+                 bg=BG2, fg=ACCENT, font=("Segoe UI", 14, "bold")).pack(pady=(16, 2))
 
-        # ── URL input ────────────────────────────────────────────────────────
-        url_frame = tk.Frame(win, bg=BG2)
-        url_frame.pack(fill=tk.X, padx=28)
-        tk.Label(url_frame, text="Album URL:", bg=BG2, fg=TEXT,
+        # ── Setup guide ──────────────────────────────────────────────────────
+        guide_frame = tk.Frame(win, bg="#f5f0e8", bd=1, relief="solid")
+        guide_frame.pack(fill=tk.X, padx=20, pady=(4, 8))
+        tk.Label(guide_frame,
+                 text="First time? You need a client_secret.json file from Google:\n"
+                      "1.  Go to console.cloud.google.com  → New Project\n"
+                      "2.  APIs & Services → Enable 'Google Photos Library API'\n"
+                      "3.  APIs & Services → Credentials → Create OAuth 2.0 Client ID\n"
+                      "       Application type: Desktop App  → Download JSON\n"
+                      "4.  OAuth Consent Screen → Add your Gmail as Test User\n"
+                      "5.  Browse to that downloaded JSON file below",
+                 bg="#f5f0e8", fg="#5a4a3a", font=("Segoe UI", 8),
+                 justify="left", padx=12, pady=8).pack(anchor="w")
+
+        # ── client_secret.json picker ─────────────────────────────────────────
+        cf = tk.Frame(win, bg=BG2)
+        cf.pack(fill=tk.X, padx=20, pady=2)
+        tk.Label(cf, text="client_secret.json:", bg=BG2, fg=TEXT,
                  font=("Segoe UI", 9, "bold")).pack(anchor="w")
+        cf2 = tk.Frame(cf, bg=BG2)
+        cf2.pack(fill=tk.X)
+        secret_var = tk.StringVar(value="")
+        secret_entry = ttk.Entry(cf2, textvariable=secret_var, width=54, font=("Segoe UI", 9))
+        secret_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        def pick_secret():
+            f = filedialog.askopenfilename(
+                title="Select client_secret.json",
+                filetypes=[("JSON files", "*.json"), ("All files", "*.*")]
+            )
+            if f:
+                secret_var.set(f)
+
+        tk.Button(cf2, text="Browse", command=pick_secret,
+                  bg=BTN_BG, fg=TEXT, relief="flat", padx=8, pady=4,
+                  font=("Segoe UI", 9), cursor="hand2", bd=0,
+                  activebackground=BTN_HOV).pack(side=tk.LEFT, padx=(6, 0))
+
+        # ── Album URL ─────────────────────────────────────────────────────────
+        uf = tk.Frame(win, bg=BG2)
+        uf.pack(fill=tk.X, padx=20, pady=4)
+        tk.Label(uf, text="Album URL (optional — leave blank for recent photos):",
+                 bg=BG2, fg=TEXT, font=("Segoe UI", 9, "bold")).pack(anchor="w")
         url_var = tk.StringVar()
-        url_entry = ttk.Entry(url_frame, textvariable=url_var, width=62,
-                              font=("Segoe UI", 10))
-        url_entry.pack(fill=tk.X, pady=(2, 10))
-        url_entry.focus()
+        ttk.Entry(uf, textvariable=url_var, width=62, font=("Segoe UI", 9)).pack(fill=tk.X)
+        tk.Label(uf, text="e.g. https://photos.google.com/album/ABC123  or leave blank",
+                 bg=BG2, fg=MUTED, font=("Segoe UI", 8)).pack(anchor="w")
 
-        # ── Save folder picker ───────────────────────────────────────────────
-        folder_frame = tk.Frame(win, bg=BG2)
-        folder_frame.pack(fill=tk.X, padx=28)
-        tk.Label(folder_frame, text="Save photos to:", bg=BG2, fg=TEXT,
+        # ── Save folder ───────────────────────────────────────────────────────
+        sf = tk.Frame(win, bg=BG2)
+        sf.pack(fill=tk.X, padx=20, pady=4)
+        tk.Label(sf, text="Save photos to:", bg=BG2, fg=TEXT,
                  font=("Segoe UI", 9, "bold")).pack(anchor="w")
-        folder_row = tk.Frame(folder_frame, bg=BG2)
-        folder_row.pack(fill=tk.X, pady=(2, 4))
+        sf2 = tk.Frame(sf, bg=BG2)
+        sf2.pack(fill=tk.X)
         save_dir_var = tk.StringVar(value=str(DATA_DIR / "google_photos"))
-        ttk.Entry(folder_row, textvariable=save_dir_var, width=48,
-                  font=("Segoe UI", 9)).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Entry(sf2, textvariable=save_dir_var, width=54, font=("Segoe UI", 9)).pack(
+            side=tk.LEFT, fill=tk.X, expand=True)
 
         def pick_folder():
-            chosen = filedialog.askdirectory(title="Choose where to save photos",
-                                             initialdir=save_dir_var.get())
-            if chosen:
-                save_dir_var.set(chosen)
+            d = filedialog.askdirectory(title="Choose save folder",
+                                        initialdir=save_dir_var.get())
+            if d:
+                save_dir_var.set(d)
 
-        tk.Button(folder_row, text="Browse...", command=pick_folder,
+        tk.Button(sf2, text="Browse", command=pick_folder,
                   bg=BTN_BG, fg=TEXT, relief="flat", padx=8, pady=4,
                   font=("Segoe UI", 9), cursor="hand2", bd=0,
                   activebackground=BTN_HOV).pack(side=tk.LEFT, padx=(6, 0))
 
         # ── Separator ────────────────────────────────────────────────────────
-        tk.Frame(win, bg=BORDER, height=1).pack(fill=tk.X, padx=28, pady=10)
+        tk.Frame(win, bg=BORDER, height=1).pack(fill=tk.X, padx=20, pady=8)
 
-        # ── Info / status area ───────────────────────────────────────────────
-        info_var   = tk.StringVar(value="Click 'Check Album' to fetch photo count and size.")
+        # ── Info / status ─────────────────────────────────────────────────────
+        info_var   = tk.StringVar(value="Fill in the fields above then click 'Connect & Check Album'.")
         status_var = tk.StringVar(value="")
         tk.Label(win, textvariable=info_var, bg=BG2, fg=TEXT,
-                 font=("Segoe UI", 10), justify="left").pack(padx=28, anchor="w")
+                 font=("Segoe UI", 9), justify="left").pack(padx=20, anchor="w")
         status_lbl = tk.Label(win, textvariable=status_var, bg=BG2, fg=MUTED,
-                              font=("Segoe UI", 9))
-        status_lbl.pack(padx=28, anchor="w", pady=(2, 0))
+                              font=("Segoe UI", 8))
+        status_lbl.pack(padx=20, anchor="w")
 
-        # ── Progress bar (shown only during download) ────────────────────────
-        pbar_outer = tk.Frame(win, bg=BG2)
-        pbar_outer.pack(fill=tk.X, padx=28, pady=4)
-        pbar = ttk.Progressbar(pbar_outer, mode="determinate", length=544)
-        pbar_lbl = tk.Label(pbar_outer, text="", bg=BG2, fg=MUTED, font=("Segoe UI", 8))
+        pbar_frame = tk.Frame(win, bg=BG2)
+        pbar_frame.pack(fill=tk.X, padx=20)
+        pbar = ttk.Progressbar(pbar_frame, mode="determinate", length=580)
+        pbar_lbl = tk.Label(pbar_frame, text="", bg=BG2, fg=MUTED, font=("Segoe UI", 8))
 
         # ── Buttons ──────────────────────────────────────────────────────────
-        tk.Frame(win, bg=BORDER, height=1).pack(fill=tk.X, padx=28, pady=(8, 0))
+        tk.Frame(win, bg=BORDER, height=1).pack(fill=tk.X, padx=20, pady=(6, 0))
         btn_row = tk.Frame(win, bg=BG2)
-        btn_row.pack(pady=10)
+        btn_row.pack(pady=8)
 
-        S = {"relief": "flat", "padx": 14, "pady": 7,
-             "font": ("Segoe UI", 10, "bold"), "cursor": "hand2", "bd": 0}
+        BS = {"relief": "flat", "padx": 12, "pady": 7, "font": ("Segoe UI", 9, "bold"),
+              "cursor": "hand2", "bd": 0}
 
-        fetch_btn    = tk.Button(btn_row, text="Check Album",
+        connect_btn  = tk.Button(btn_row, text="Connect & Check Album",
                                  bg=ACCENT2, fg="#fffdf9",
-                                 activebackground=ACCENT, **S)
-        fetch_btn.pack(side=tk.LEFT, padx=5)
+                                 activebackground=ACCENT, **BS)
+        connect_btn.pack(side=tk.LEFT, padx=4)
 
         download_btn = tk.Button(btn_row, text="Download & Detect Faces",
                                  bg=GREEN, fg="#fffdf9",
-                                 activebackground="#4a7a4a", **S,
-                                 state="disabled")
-        download_btn.pack(side=tk.LEFT, padx=5)
+                                 activebackground="#4a7a4a", **BS, state="disabled")
+        download_btn.pack(side=tk.LEFT, padx=4)
+
+        tk.Button(btn_row, text="Clear Saved Login", command=self._gphoto_clear_token,
+                  bg=BTN_BG, fg=TEXT, relief="flat", padx=12, pady=7,
+                  font=("Segoe UI", 9), cursor="hand2", bd=0,
+                  activebackground=BTN_HOV).pack(side=tk.LEFT, padx=4)
 
         tk.Button(btn_row, text="Cancel", command=win.destroy,
-                  bg=BTN_BG, fg=TEXT, relief="flat", padx=14, pady=7,
+                  bg=BTN_BG, fg=TEXT, relief="flat", padx=12, pady=7,
                   font=("Segoe UI", 9), cursor="hand2", bd=0,
-                  activebackground=BTN_HOV).pack(side=tk.LEFT, padx=5)
+                  activebackground=BTN_HOV).pack(side=tk.LEFT, padx=4)
 
-        tk.Label(win, text="Only PUBLIC albums work.  Private albums require Google OAuth login.",
-                 bg=BG2, fg=MUTED, font=("Segoe UI", 8)).pack(pady=(0, 8))
+        # ── Shared state ──────────────────────────────────────────────────────
+        album = {"items": [], "creds": None}
 
-        # ── Shared state dict ────────────────────────────────────────────────
-        album = {"urls": [], "count": 0, "est_mb": 0.0}
+        def set_info(msg):
+            info_var.set(msg)
+            win.update_idletasks()
+
+        def set_status(msg, color=MUTED):
+            status_var.set(msg)
+            status_lbl.config(fg=color)
+            win.update_idletasks()
+
+        # ────────────────────────────────────────────────────────────────────
+        # STEP 1+2 — OAuth login + fetch album info
+        # ────────────────────────────────────────────────────────────────────
+        def connect_and_check():
+            secret_path = secret_var.get().strip()
+            if not secret_path:
+                set_status("Please select your client_secret.json file.", RED)
+                return
+            if not Path(secret_path).exists():
+                set_status("File not found: " + secret_path, RED)
+                return
+
+            connect_btn.config(state="disabled", text="Connecting...")
+            download_btn.config(state="disabled")
+            pbar.pack_forget()
+            pbar_lbl.pack_forget()
+            set_info("Installing Google auth libraries and signing in...")
+            set_status("", MUTED)
+
+            def run():
+                try:
+                    if not self._gphoto_install_deps(
+                            lambda m: self.root.after(0, lambda msg=m: set_status(msg, YELLOW))):
+                        self.root.after(0, lambda: set_status(
+                            "Failed to install Google auth libraries.", RED))
+                        self.root.after(0, lambda: connect_btn.config(
+                            state="normal", text="Connect & Check Album"))
+                        return
+
+                    self.root.after(0, lambda: set_status(
+                        "Browser will open for Google sign-in...", YELLOW))
+
+                    creds = self._gphoto_get_credentials(
+                        secret_path,
+                        lambda m: self.root.after(0, lambda msg=m: set_status(msg, YELLOW))
+                    )
+
+                    if not creds:
+                        self.root.after(0, lambda: set_status("Sign-in failed.", RED))
+                        self.root.after(0, lambda: connect_btn.config(
+                            state="normal", text="Connect & Check Album"))
+                        return
+
+                    album["creds"] = creds
+                    self.root.after(0, lambda: set_status("Signed in! Fetching album...", GREEN))
+
+                    items = self._gphoto_list_album_items(
+                        creds, url_var.get().strip(),
+                        lambda m: self.root.after(0, lambda msg=m: set_status(msg, MUTED))
+                    )
+                    album["items"] = items
+                    count  = len(items)
+                    est_mb = round(count * 3.5, 1)
+                    sz_str = (str(round(est_mb/1024, 2)) + " GB") if est_mb > 1024 else (str(est_mb) + " MB")
+
+                    if count == 0:
+                        self.root.after(0, lambda: set_info(
+                            "Signed in but no photos found.\n"
+                            "Check the album URL or make sure the album is shared with you."))
+                        self.root.after(0, lambda: set_status("", RED))
+                        self.root.after(0, lambda: connect_btn.config(
+                            state="normal", text="Connect & Check Album"))
+                        return
+
+                    msg = (
+                        "Connected and ready!\n\n"
+                        "   Photos found    :  " + str(count) + " images\n"
+                        "   Estimated size  :  " + sz_str + "  (~3.5 MB per photo)\n"
+                        "   Save location   :  " + save_dir_var.get()
+                    )
+                    self.root.after(0, lambda: set_info(msg))
+                    self.root.after(0, lambda: set_status(
+                        "Ready! Click 'Download & Detect Faces' to proceed.", GREEN))
+                    self.root.after(0, lambda: download_btn.config(state="normal"))
+                    self.root.after(0, lambda: connect_btn.config(
+                        state="normal", text="Re-Check"))
+
+                except Exception as e:
+                    err = str(e)[:120]
+                    self.root.after(0, lambda: set_status("Error: " + err, RED))
+                    self.root.after(0, lambda: connect_btn.config(
+                        state="normal", text="Connect & Check Album"))
+
+            threading.Thread(target=run, daemon=True).start()
+
+        connect_btn.config(command=connect_and_check)
+
+        # ────────────────────────────────────────────────────────────────────
+        # STEP 3 — Confirm + Download + Auto-detect
+        # ────────────────────────────────────────────────────────────────────
+        def start_download():
+            items  = album["items"]
+            creds  = album["creds"]
+            count  = len(items)
+            est_mb = round(count * 3.5, 1)
+            sz_str = (str(round(est_mb/1024, 2)) + " GB") if est_mb > 1024 else (str(est_mb) + " MB")
+
+            if count == 0 or not creds:
+                set_status("Connect and check album first.", RED)
+                return
+
+            save_dir = Path(save_dir_var.get().strip())
+
+            confirmed = messagebox.askyesno(
+                "Confirm Download",
+                "You are about to download:\n\n"
+                "   Photos    :  " + str(count) + " images\n"
+                "   Est. size :  " + sz_str + "\n"
+                "   Save to   :  " + str(save_dir) + "\n\n"
+                "Face detection will start automatically\n"
+                "after download completes.\n\nProceed?",
+                parent=win
+            )
+            if not confirmed:
+                return
+
+            save_dir.mkdir(parents=True, exist_ok=True)
+            connect_btn.config(state="disabled")
+            download_btn.config(state="disabled", text="Downloading...")
+            pbar.config(maximum=count, value=0)
+            pbar.pack(fill=tk.X, pady=(4, 0))
+            pbar_lbl.config(text="Starting download...")
+            pbar_lbl.pack(anchor="w")
+
+            def run():
+                try:
+                    import requests as req_lib
+                    headers = {"Authorization": "Bearer " + creds.token}
+                    saved   = 0
+                    total_bytes = 0
+
+                    for i, (filename, dl_url) in enumerate(items):
+                        try:
+                            r = req_lib.get(dl_url, headers=headers, timeout=60)
+                            r.raise_for_status()
+                            out = save_dir / filename
+                            # Avoid overwriting — add index if name clashes
+                            if out.exists():
+                                stem = out.stem
+                                out  = save_dir / (stem + "_" + str(i+1) + out.suffix)
+                            out.write_bytes(r.content)
+                            self.db.add_image(str(out))
+                            saved       += 1
+                            total_bytes += len(r.content)
+                        except:
+                            pass
+
+                        done = i + 1
+                        rem  = count - done
+                        mb   = round(total_bytes / 1024 / 1024, 1)
+
+                        def upd(d=done, re2=rem, m=mb):
+                            try:
+                                pbar["value"] = d
+                                pbar_lbl.config(text=(
+                                    str(d) + " / " + str(count) +
+                                    "   |   " + str(re2) + " remaining" +
+                                    "   |   " + str(m) + " MB downloaded"
+                                ))
+                                set_status("Downloading " + str(d) + " of " + str(count) + "...", MUTED)
+                            except:
+                                pass
+
+                        self.root.after(0, upd)
+
+                    self.root.after(0, lambda: self._gphoto_done(win, saved, auto_detect=True))
+
+                except Exception as e:
+                    self.root.after(0, lambda: set_status("Download error: " + str(e)[:100], RED))
+                    self.root.after(0, lambda: download_btn.config(
+                        state="normal", text="Download & Detect Faces"))
+
+            threading.Thread(target=run, daemon=True).start()
+
+        download_btn.config(command=start_download)
 
         def set_info(msg):
             info_var.set(msg)
@@ -952,60 +1312,13 @@ class App:
 
         download_btn.config(command=start_download)
 
-    def _scrape_google_photos_fallback(self, url, dest_dir):
-        """
-        Fallback: scrape image URLs directly from the Google Photos album HTML page.
-        This works for simple public albums when gallery-dl fails.
-        """
-        try:
-            import requests
-            from bs4 import BeautifulSoup
-            import re
-
-            self.status("Fallback: scraping album page...")
-            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                                     "AppleWebKit/537.36 Chrome/120 Safari/537.36"}
-            resp = requests.get(url, headers=headers, timeout=30)
-            resp.raise_for_status()
-
-            # Google Photos embeds image URLs in the page JS as JSON-like arrays
-            # Pattern: ["https://lh3.googleusercontent.com/..."] (high-res image URLs)
-            img_urls = re.findall(
-                r'(https://lh3\.googleusercontent\.com/[A-Za-z0-9_\-]+=w\d+[^\'"]*)',
-                resp.text
-            )
-            # Deduplicate
-            seen = set()
-            unique_urls = []
-            for u in img_urls:
-                # Force highest resolution: replace size suffix with =d (download)
-                base = re.sub(r'=w\d+.*$', '', u)
-                if base not in seen:
-                    seen.add(base)
-                    unique_urls.append(base + "=d")
-
-            if not unique_urls:
-                return []
-
-            self.status("Downloading " + str(len(unique_urls)) + " images...")
-            saved = []
-            for i, img_url in enumerate(unique_urls):
-                try:
-                    r = requests.get(img_url, headers=headers, timeout=20)
-                    r.raise_for_status()
-                    # Determine extension from content-type
-                    ct = r.headers.get("Content-Type", "image/jpeg")
-                    ext = ".jpg" if "jpeg" in ct else ".png" if "png" in ct else ".jpg"
-                    out = dest_dir / ("photo_" + str(i+1).zfill(4) + ext)
-                    out.write_bytes(r.content)
-                    saved.append(out)
-                    self.status("Downloaded " + str(i+1) + " / " + str(len(unique_urls)))
-                except:
-                    continue
-            return saved
-        except Exception as e:
-            self.status("Fallback scraping failed: " + str(e)[:60])
-            return []
+    def _gphoto_clear_token(self):
+        """Delete saved OAuth token so user can re-login with a different account."""
+        if self.GPHOTO_TOKEN.exists():
+            self.GPHOTO_TOKEN.unlink()
+            messagebox.showinfo("Done", "Saved login cleared.\nYou will be asked to sign in again next time.")
+        else:
+            messagebox.showinfo("Nothing to clear", "No saved login found.")
 
     def _gphoto_done(self, win, count, auto_detect=False):
         try:
