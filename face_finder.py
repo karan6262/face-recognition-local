@@ -144,7 +144,9 @@ class DB:
         """Get the next available cluster ID (max + 1)."""
         row = self.conn.execute("SELECT MAX(cluster_id) FROM faces").fetchone()
         return (row[0] or 0) + 1
-        # Returns path + the crop_path of the first detected face in that image
+
+    def get_images_for_cluster(self, cluster_id):
+        """Returns path + the crop_path of the first detected face in that image."""
         return self.conn.execute("""
             SELECT i.path,
                    (SELECT f2.crop_path FROM faces f2
