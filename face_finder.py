@@ -25,20 +25,20 @@ for _d in [DATA_DIR, CROP_DIR, THUMB_DIR]:
 
 SUPPORTED = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp"}
 
-# ─── Colour Palette (Soft Purple/Blue Dark Theme) ────────────────────────────
-BG        = "#16161e"   # main background
-BG2       = "#1a1b26"   # panel background
-CARD      = "#24283b"   # card / treeview background
-ACCENT    = "#7aa2f7"   # blue accent
-ACCENT2   = "#bb9af7"   # purple accent
-GREEN     = "#9ece6a"   # success / labeled
-RED       = "#f7768e"   # warning / unnamed
-YELLOW    = "#e0af68"   # faces counter
-TEXT      = "#c0caf5"   # main text
-MUTED     = "#565f89"   # muted text
-BORDER    = "#2f3549"   # borders
-BTN_BG    = "#3b4261"   # button background
-BTN_HOV   = "#414868"   # button hover
+# ─── Colour Palette (Warm Natural Light Theme) ───────────────────────────────
+BG        = "#faf7f2"   # warm off-white background
+BG2       = "#f0ebe3"   # slightly darker panel background
+CARD      = "#fffdf9"   # clean white card
+ACCENT    = "#7c6f5b"   # warm brown accent (titles, headers)
+ACCENT2   = "#a0845c"   # golden brown accent
+GREEN     = "#5a8a5a"   # muted forest green (labeled)
+RED       = "#b85c5c"   # muted terracotta (unnamed)
+YELLOW    = "#a07840"   # warm amber (faces counter)
+TEXT      = "#3a3228"   # dark warm brown (main text)
+MUTED     = "#9c8e80"   # warm grey (muted text)
+BORDER    = "#ddd5c8"   # soft sand border
+BTN_BG    = "#e8e0d4"   # light warm sand button
+BTN_HOV   = "#d9cfc2"   # slightly darker on hover
 
 
 
@@ -349,7 +349,7 @@ class ClusterCard(tk.Frame):
         self._count_lbl.pack(fill=tk.X)
 
         # ctrl-select badge label (hidden by default)
-        self._badge = tk.Label(self, text="✓", bg=ACCENT2, fg=BG,
+        self._badge = tk.Label(self, text="✓", bg=ACCENT2, fg="#fffdf9",
                                font=("Segoe UI", 9, "bold"), padx=4)
 
         # bind clicks on every child widget
@@ -374,9 +374,9 @@ class ClusterCard(tk.Frame):
 
     def _refresh_bg(self):
         if self.ctrl_selected:
-            bg = "#2e2a45"           # dark purple tint for multi-select
+            bg = "#f5ede0"           # warm amber tint for multi-select
         elif self.selected:
-            bg = BTN_HOV             # blue tint for single select
+            bg = BTN_HOV             # sand tint for single select
         else:
             bg = CARD
         self._set_bg_recursive(self, bg)
@@ -413,13 +413,17 @@ class App:
         s = ttk.Style()
         s.theme_use("clam")
         s.configure("TFrame",        background=BG)
-        s.configure("TLabel",        background=BG,    foreground=TEXT)
-        s.configure("TButton",       background=BTN_BG, foreground=TEXT, padding=7, relief="flat")
+        s.configure("TLabel",        background=BG,     foreground=TEXT)
+        s.configure("TButton",       background=BTN_BG,  foreground=TEXT, padding=7, relief="flat")
         s.map("TButton",             background=[("active", BTN_HOV)])
-        s.configure("TEntry",        fieldbackground=CARD, foreground=TEXT, insertcolor=TEXT)
-        s.configure("TScrollbar",    background=BORDER, troughcolor=BG2, arrowcolor=MUTED)
-        s.configure("Horizontal.TProgressbar", troughcolor=CARD, background=ACCENT)
-        s.configure("TProgressbar",  troughcolor=CARD, background=ACCENT)
+        s.configure("TEntry",        fieldbackground=CARD, foreground=TEXT, insertcolor=TEXT,
+                    bordercolor=BORDER, lightcolor=BORDER, darkcolor=BORDER)
+        s.configure("TScrollbar",    background=BTN_BG, troughcolor=BG2,
+                    arrowcolor=MUTED, bordercolor=BORDER)
+        s.configure("Horizontal.TProgressbar", troughcolor=BG2, background=ACCENT2,
+                    bordercolor=BORDER)
+        s.configure("TProgressbar",  troughcolor=BG2,  background=ACCENT2,
+                    bordercolor=BORDER)
 
     # ── Build UI ──────────────────────────────────────────────────────────────
     def _build_ui(self):
@@ -1038,7 +1042,7 @@ class App:
 
         btn_row = tk.Frame(win, bg=BG2)
         btn_row.pack(pady=12)
-        btn_cfg = {"bg": ACCENT, "fg": BG, "relief": "flat", "padx": 14, "pady": 8,
+        btn_cfg = {"bg": ACCENT2, "fg": "#fffdf9", "relief": "flat", "padx": 14, "pady": 8,
                    "font": ("Segoe UI", 10, "bold"), "cursor": "hand2", "bd": 0}
         tk.Button(btn_row, text="Merge Selected Clusters", command=do_merge, **btn_cfg).pack(side=tk.LEFT, padx=8)
         tk.Button(btn_row, text="Cancel", command=win.destroy,
