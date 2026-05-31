@@ -118,7 +118,32 @@ class DB:
         ).fetchone()
         return row["crop_path"] if row else None
 
-    def get_images_for_cluster(self, cluster_id):
+    def move_image_to_cluster(self, image_path, from_cluster_id, to_cluster_id):
+        """Move all faces of an image from one cluster to another. to_cluster_id=-1 means unassign."""
+        img_row = self.conn.execute("SELECT id FROM images WHERE path=?", (image_path,)).fetchone()
+        if not img_row:
+            return
+        img_id = img_row["id"]
+        if to_cluster_id == -1:
+            # Unassign — just set cluster_id to -1
+            self.conn.execute(
+                "UPDATE faces SET cluster_id=-1, person_name='' WHERE image_id=? AND cluster_id=?",
+                (img_id, from_cluster_id))
+        else:
+            name_row = self.conn.execute("SELECT person_name FROM clusters WHERE id=?",
+                                         (to_cluster_id,)).fetchone()
+            name = name_row["person_name"] if name_row else ""
+            self.conn.execute(
+                "UPDATE faces SET cluster_id=?, person_name=? WHERE image_id=? AND cluster_id=?",
+                (to_cluster_id, name, img_id, from_cluster_id))
+            self.conn.execute("INSERT OR IGNORE INTO clusters (id, person_name) VALUES (?,?)",
+                              (to_cluster_id, name))
+        self.conn.commit()
+
+    def get_next_cluster_id(self):
+        """Get the next available cluster ID (max + 1)."""
+        row = self.conn.execute("SELECT MAX(cluster_id) FROM faces").fetchone()
+        return (row[0] or 0) + 1
         # Returns path + the crop_path of the first detected face in that image
         return self.conn.execute("""
             SELECT i.path,
@@ -416,6 +441,51 @@ class App:
         self._build_ui()
         self._load_engine_async()
 
+    # ── Loading overlay ──────────────────────────────────────────────────────
+    def show_loading(self, message="Please wait..."):
+        """Show a full-window loading overlay so user knows work is happening."""
+        self._loading_win = tk.Toplevel(self.root)
+        self._loading_win.overrideredirect(True)  # no title bar
+        self._loading_win.configure(bg=BG2)
+        # Center over main window
+        self.root.update_idletasks()
+        rw, rh = self.root.winfo_width(), self.root.winfo_height()
+        rx, ry = self.root.winfo_x(), self.root.winfo_y()
+        w, h = 380, 140
+        x = rx + (rw - w) // 2
+        y = ry + (rh - h) // 2
+        self._loading_win.geometry(str(w) + "x" + str(h) + "+" + str(x) + "+" + str(y))
+        self._loading_win.grab_set()
+        # Content
+        tk.Frame(self._loading_win, bg=BORDER, height=2).pack(fill=tk.X)
+        inner = tk.Frame(self._loading_win, bg=BG2, padx=20, pady=20)
+        inner.pack(fill=tk.BOTH, expand=True)
+        self._loading_msg_var = tk.StringVar(value=message)
+        tk.Label(inner, textvariable=self._loading_msg_var,
+                 bg=BG2, fg=ACCENT, font=("Segoe UI", 11, "bold")).pack(pady=(0, 10))
+        self._loading_bar = ttk.Progressbar(inner, mode="indeterminate", length=320)
+        self._loading_bar.pack()
+        self._loading_bar.start(12)
+        tk.Frame(self._loading_win, bg=BORDER, height=2).pack(fill=tk.X)
+        self._loading_win.update()
+
+    def update_loading(self, message):
+        """Update the loading overlay message."""
+        try:
+            self._loading_msg_var.set(message)
+            self._loading_win.update()
+        except:
+            pass
+
+    def hide_loading(self):
+        """Destroy the loading overlay."""
+        try:
+            self._loading_bar.stop()
+            self._loading_win.grab_release()
+            self._loading_win.destroy()
+        except:
+            pass
+
     # ── Apply global styles ───────────────────────────────────────────────────
     def _apply_styles(self):
         s = ttk.Style()
@@ -649,12 +719,13 @@ class App:
         image_urls = set()
 
         with sync_playwright() as p:
+            # Use a large viewport — Google Photos loads more thumbnails in a wider window
             browser = p.chromium.launch(headless=True)
             context = browser.new_context(
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                            "AppleWebKit/537.36 (KHTML, like Gecko) "
                            "Chrome/124.0.0.0 Safari/537.36",
-                viewport={"width": 1440, "height": 900}
+                viewport={"width": 1920, "height": 1080}
             )
             page = context.new_page()
 
@@ -673,74 +744,79 @@ class App:
 
             log_fn("Loading album page...")
             try:
-                page.goto(url, wait_until="networkidle", timeout=45000)
+                page.goto(url, wait_until="domcontentloaded", timeout=60000)
             except:
-                # timeout is ok — page may still have content
                 pass
-            time.sleep(3)
+
+            # Wait longer for JS to fully render the album grid
+            time.sleep(5)
+
+            log_fn("Scrolling to load all photos...")
 
             # ── Smart infinite scroll ──────────────────────────────────────
-            # Stop only after 5 consecutive scroll rounds with zero new images
-            log_fn("Scrolling to load all photos...")
+            # Stop only after 10 consecutive rounds with zero new images
+            # This handles slow network and large albums correctly
             no_new_count = 0
-            max_no_new   = 5          # how many rounds of no new images before stopping
+            max_no_new   = 10         # 10 empty rounds = definitely finished
             round_num    = 0
-            max_rounds   = 300        # safety cap (~1000 photos at ~3-4 per round)
+            max_rounds   = 600        # safety cap for huge albums (1000+ photos)
 
-            while no_new_count < max_no_new and round_num < max_rounds:
-                before = len(image_urls)
-
-                # Scroll to absolute bottom
-                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                time.sleep(0.5)
-                page.keyboard.press("End")
-                time.sleep(0.5)
-
-                # Also grab any visible img src tags directly from DOM
+            def scrape_dom():
+                """Grab all visible img src + data-src from the DOM directly."""
                 try:
-                    srcs = page.eval_on_selector_all(
-                        "img[src*='lh3.googleusercontent.com']",
-                        "els => els.map(e => e.src)"
-                    )
-                    for src in srcs:
+                    srcs = page.evaluate("""
+                        () => {
+                            const imgs = document.querySelectorAll('img');
+                            return Array.from(imgs).map(i =>
+                                i.src || i.getAttribute('data-src') || ''
+                            ).filter(s => s.includes('lh3.googleusercontent.com'));
+                        }
+                    """)
+                    for src in (srcs or []):
                         base = re.sub(r'[=?].*$', '', src)
                         if len(base) > 55:
                             image_urls.add(base)
                 except:
                     pass
 
-                # Wait for network to settle after lazy-load triggers
+            while no_new_count < max_no_new and round_num < max_rounds:
+                before = len(image_urls)
+
+                # Scroll down using multiple methods to trigger all lazy loaders
+                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                time.sleep(0.3)
+                page.keyboard.press("End")
+                time.sleep(0.3)
+                page.mouse.wheel(0, 5000)
+                time.sleep(0.3)
+
+                scrape_dom()
+
+                # Give network requests time to fire and complete
                 try:
-                    page.wait_for_load_state("networkidle", timeout=3000)
+                    page.wait_for_load_state("networkidle", timeout=4000)
                 except:
                     pass
+
+                # Extra wait every 10 rounds to let slow connections catch up
+                if round_num % 10 == 0 and round_num > 0:
+                    time.sleep(1.5)
 
                 after = len(image_urls)
                 if after == before:
                     no_new_count += 1
                 else:
-                    no_new_count = 0   # reset — we found new ones
+                    no_new_count = 0  # found new ones — reset counter
 
                 round_num += 1
-                if after > 0 and after % 10 == 0:
-                    log_fn("Found " + str(after) + " photos so far, still scrolling...")
 
-            # Final DOM scrape after scrolling completes
-            try:
-                all_imgs = page.eval_on_selector_all(
-                    "img[src*='lh3.googleusercontent.com'], "
-                    "img[data-src*='lh3.googleusercontent.com']",
-                    "els => els.map(e => e.src || e.getAttribute('data-src'))"
-                )
-                for src in all_imgs:
-                    if src:
-                        base = re.sub(r'[=?].*$', '', src)
-                        if len(base) > 55:
-                            image_urls.add(base)
-            except:
-                pass
+                if after > 0 and round_num % 5 == 0:
+                    log_fn("Found " + str(after) + " photos, scrolling... (round " + str(round_num) + ")")
 
-            log_fn("Finished scrolling. Total photos found: " + str(len(image_urls)))
+            # Final thorough DOM scrape
+            scrape_dom()
+
+            log_fn("Finished! Total photos found: " + str(len(image_urls)))
             browser.close()
 
         return list(image_urls)
@@ -1335,6 +1411,7 @@ class App:
     def redetect_faces(self):
         if not messagebox.askyesno("Re-Detect All", "Delete all face data and re-scan? Continue?"):
             return
+        self.show_loading("Clearing old data...")
         self.db.reset_scanned()
         for f in CROP_DIR.iterdir():
             try:
@@ -1343,6 +1420,7 @@ class App:
                 pass
         self.face_thumb_cache.clear()
         self.refresh_cluster_list()
+        self.hide_loading()
         self.detect_faces()
 
 
@@ -1366,6 +1444,7 @@ class App:
         if tol is None:
             return
         self.progress.start()
+        self.show_loading("Clustering " + str(len(rows)) + " faces...\nThis may take a moment.")
         self.status("Clustering " + str(len(rows)) + " faces...")
         def run():
             embs   = [json.loads(r["embedding"]) for r in rows]
@@ -1378,6 +1457,7 @@ class App:
 
     def _cluster_done(self, n):
         self.progress.stop()
+        self.hide_loading()
         self.face_thumb_cache.clear()
         self.refresh_cluster_list()
         self.status("Found " + str(n) + " clusters. Select one on the left.")
@@ -1487,72 +1567,247 @@ class App:
 
         COLS     = 5
         THUMB    = 200
-        FACE_SZ  = 56    # face crop thumbnail size in corner
+        FACE_SZ  = 56
+
+        # ── Selection state for multi-select move ────────────────────────────
+        selected_paths = set()
+
+        # ── Action bar (shown above grid) ────────────────────────────────────
+        action_bar = tk.Frame(self.grid_frame, bg=BG, pady=4)
+        action_bar.grid(row=0, column=0, columnspan=COLS, sticky="ew", padx=8, pady=(0, 4))
+        tk.Label(action_bar,
+                 text="Right-click or Ctrl+Click a photo to move/remove it from this cluster",
+                 bg=BG, fg=MUTED, font=("Segoe UI", 8)).pack(side=tk.LEFT)
+        sel_lbl = tk.Label(action_bar, text="", bg=BG, fg=ACCENT2,
+                           font=("Segoe UI", 8, "bold"))
+        sel_lbl.pack(side=tk.LEFT, padx=10)
+
+        def update_sel_label():
+            n = len(selected_paths)
+            if n > 0:
+                sel_lbl.config(text=str(n) + " selected  —  right-click to move/remove")
+            else:
+                sel_lbl.config(text="")
+
+        def build_context_menu(path, canv, card):
+            menu = tk.Menu(self.root, tearoff=0, bg=CARD, fg=TEXT,
+                           activebackground=BTN_HOV, activeforeground=TEXT,
+                           font=("Segoe UI", 9))
+            menu.add_command(label="Open photo",
+                             command=lambda: self._open_file(path))
+            menu.add_separator()
+            menu.add_command(label="Move to New Cluster",
+                             command=lambda: self._move_photos_to_new_cluster(
+                                 selected_paths if selected_paths else {path},
+                                 cluster_id))
+            menu.add_command(label="Move to Existing Cluster...",
+                             command=lambda: self._move_photos_to_existing_cluster(
+                                 selected_paths if selected_paths else {path},
+                                 cluster_id))
+            menu.add_separator()
+            menu.add_command(label="Remove from this cluster (unassign)",
+                             command=lambda: self._remove_photos_from_cluster(
+                                 selected_paths if selected_paths else {path},
+                                 cluster_id))
+            return menu
+
+        def toggle_select(path, canv, card, overlay_id):
+            if path in selected_paths:
+                selected_paths.discard(path)
+                canv.itemconfig(overlay_id, state="hidden")
+                card.configure(bg=CARD)
+            else:
+                selected_paths.add(path)
+                canv.itemconfig(overlay_id, state="normal")
+                card.configure(bg=BTN_HOV)
+            update_sel_label()
 
         for idx, row in enumerate(rows):
             path      = row["path"]
             face_crop = row["face_crop"] if row["face_crop"] else None
             r, c = divmod(idx, COLS)
 
-            # Outer card
             card = tk.Frame(self.grid_frame, bg=CARD, padx=4, pady=4)
-            card.grid(row=r, column=c, padx=8, pady=8)
+            card.grid(row=r + 1, column=c, padx=8, pady=8)  # +1 for action_bar row
 
-            # ── Main photo thumbnail ────────────────────────────────────────
             try:
                 img = Image.open(path)
                 img.thumbnail((THUMB, THUMB))
                 photo = ImageTk.PhotoImage(img)
                 self.photo_cache[path] = photo
 
-                # Canvas so we can overlay the face badge on top
                 canv = tk.Canvas(card, width=photo.width(), height=photo.height(),
                                  bg=CARD, highlightthickness=0, cursor="hand2")
                 canv.pack()
                 canv.create_image(0, 0, anchor="nw", image=photo)
-                canv.bind("<Button-1>", lambda e, p=path: self._open_file(p))
 
-                # ── Face crop badge — top-right corner ──────────────────────
+                # Blue selection overlay (hidden by default)
+                overlay_id = canv.create_rectangle(
+                    0, 0, photo.width(), photo.height(),
+                    fill=ACCENT, outline="", stipple="gray25", state="hidden")
+
+                # Checkmark shown when selected
+                check_id = canv.create_text(
+                    photo.width() - 12, 12,
+                    text="✓", fill="#fffdf9",
+                    font=("Segoe UI", 14, "bold"), state="hidden")
+
+                # Left-click → open; Ctrl+Click → select/deselect
+                def on_click(e, p=path, cv=canv, cd=card, ov=overlay_id, ck=check_id):
+                    if e.state & 0x0004:  # Ctrl held
+                        if p in selected_paths:
+                            selected_paths.discard(p)
+                            cv.itemconfig(ov, state="hidden")
+                            cv.itemconfig(ck, state="hidden")
+                            cd.configure(bg=CARD)
+                        else:
+                            selected_paths.add(p)
+                            cv.itemconfig(ov, state="normal")
+                            cv.itemconfig(ck, state="normal")
+                            cd.configure(bg=BTN_HOV)
+                        update_sel_label()
+                    else:
+                        self._open_file(p)
+
+                def on_right_click(e, p=path, cv=canv, cd=card):
+                    menu = build_context_menu(p, cv, cd)
+                    menu.tk_popup(e.x_root, e.y_root)
+
+                canv.bind("<Button-1>", on_click)
+                canv.bind("<Button-3>", on_right_click)  # Right-click
+
+                # Face crop badge top-right
                 if face_crop and Path(face_crop).exists():
                     try:
-                        fc_img = Image.open(face_crop).resize(
-                            (FACE_SZ, FACE_SZ), Image.LANCZOS)
-
-                        # Add a coloured ring border so it stands out
-                        bordered = Image.new("RGB",
-                                            (FACE_SZ + 4, FACE_SZ + 4), ACCENT2)
+                        fc_img = Image.open(face_crop).resize((FACE_SZ, FACE_SZ), Image.LANCZOS)
+                        bordered = Image.new("RGB", (FACE_SZ + 4, FACE_SZ + 4), ACCENT2)
                         bordered.paste(fc_img, (2, 2))
                         fc_photo = ImageTk.PhotoImage(bordered)
-                        # Keep reference alive on the canvas itself
                         canv._face_photo = fc_photo
-                        # Place badge top-right, with 4px margin
                         bx = photo.width() - (FACE_SZ + 4) - 4
                         canv.create_image(bx, 4, anchor="nw", image=fc_photo)
-
-                        # Tooltip-style label under the badge
-                        canv.create_rectangle(
-                            bx - 2, FACE_SZ + 8,
-                            bx + (FACE_SZ + 6), FACE_SZ + 22,
-                            fill=ACCENT2, outline=""
-                        )
-                        canv.create_text(
-                            bx + (FACE_SZ // 2) + 2, FACE_SZ + 15,
-                            text="face", fill="#fffdf9",
-                            font=("Segoe UI", 7, "bold")
-                        )
+                        canv.create_rectangle(bx - 2, FACE_SZ + 8,
+                                              bx + (FACE_SZ + 6), FACE_SZ + 22,
+                                              fill=ACCENT2, outline="")
+                        canv.create_text(bx + (FACE_SZ // 2) + 2, FACE_SZ + 15,
+                                         text="face", fill="#fffdf9",
+                                         font=("Segoe UI", 7, "bold"))
                     except:
                         pass
+
             except:
                 tk.Label(card, text="Error loading", bg=CARD, fg=RED).pack()
 
-            # ── Filename label ──────────────────────────────────────────────
             fname = Path(path).name
             if len(fname) > 22:
                 fname = fname[:20] + "..."
-            tk.Label(card, text=fname, bg=CARD, fg=MUTED,
-                     font=("Segoe UI", 8)).pack()
+            tk.Label(card, text=fname, bg=CARD, fg=MUTED, font=("Segoe UI", 8)).pack()
 
-        self.status("Showing " + str(len(rows)) + " photos for " + label)
+        self.status("Showing " + str(len(rows)) + " photos for " + label +
+                    "  |  Ctrl+Click to select  |  Right-click for options")
+
+    # ── Remove / Move photos between clusters ─────────────────────────────────
+    def _move_photos_to_new_cluster(self, paths, from_cluster_id):
+        """Move selected photos to a brand-new cluster."""
+        if not paths:
+            return
+        new_id = self.db.get_next_cluster_id()
+        for path in paths:
+            self.db.move_image_to_cluster(path, from_cluster_id, new_id)
+        self.face_thumb_cache.clear()
+        self.refresh_cluster_list()
+        self._show_cluster_photos(from_cluster_id)
+        self.status("Moved " + str(len(paths)) + " photo(s) to new Cluster " + str(new_id))
+        messagebox.showinfo("Done",
+                            "Moved " + str(len(paths)) + " photo(s) to a new cluster!\n"
+                            "You can find it in the left panel as Cluster " + str(new_id))
+
+    def _move_photos_to_existing_cluster(self, paths, from_cluster_id):
+        """Show a picker to choose which existing cluster to move photos to."""
+        if not paths:
+            return
+        clusters = self.db.get_clusters()
+        if not clusters:
+            messagebox.showinfo("No Clusters", "No other clusters exist yet.")
+            return
+
+        win = tk.Toplevel(self.root)
+        win.title("Move to Cluster")
+        win.geometry("420x480")
+        win.configure(bg=BG2)
+        win.grab_set()
+
+        tk.Label(win, text="Move " + str(len(paths)) + " photo(s) to:",
+                 bg=BG2, fg=ACCENT, font=("Segoe UI", 12, "bold")).pack(pady=(14, 4))
+        tk.Label(win, text="Click a cluster to move selected photos into it.",
+                 bg=BG2, fg=MUTED, font=("Segoe UI", 9)).pack(pady=(0, 8))
+
+        lf = tk.Frame(win, bg=BG2)
+        lf.pack(fill=tk.BOTH, expand=True, padx=14)
+
+        scroll_canvas = tk.Canvas(lf, bg=BG2, highlightthickness=0)
+        sb = tk.Scrollbar(lf, orient=tk.VERTICAL, command=scroll_canvas.yview)
+        scroll_canvas.configure(yscrollcommand=sb.set)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        scroll_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        inner = tk.Frame(scroll_canvas, bg=BG2)
+        scroll_canvas.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>", lambda e: scroll_canvas.configure(
+            scrollregion=scroll_canvas.bbox("all")))
+
+        def do_move(target_id):
+            for path in paths:
+                self.db.move_image_to_cluster(path, from_cluster_id, target_id)
+            self.face_thumb_cache.clear()
+            self.refresh_cluster_list()
+            self._show_cluster_photos(from_cluster_id)
+            win.destroy()
+            self.status("Moved " + str(len(paths)) + " photo(s) to Cluster " + str(target_id))
+
+        for row in clusters:
+            cid  = row["cluster_id"]
+            if cid == from_cluster_id:
+                continue
+            name = row["person_name"] or ("Cluster " + str(cid))
+            photo = self._get_face_thumb(cid)
+            rf = tk.Frame(inner, bg=CARD, pady=4, cursor="hand2")
+            rf.pack(fill=tk.X, padx=4, pady=2)
+            if photo:
+                c = tk.Canvas(rf, width=48, height=48, bg=CARD, highlightthickness=0)
+                c.pack(side=tk.LEFT, padx=(6, 4))
+                c.create_image(0, 0, anchor="nw", image=photo)
+                c.image = photo
+            txt = tk.Frame(rf, bg=CARD)
+            txt.pack(side=tk.LEFT, fill=tk.X)
+            tk.Label(txt, text=name, bg=CARD, fg=TEXT,
+                     font=("Segoe UI", 10, "bold")).pack(anchor="w")
+            tk.Label(txt, text=str(row["photo_count"]) + " photos",
+                     bg=CARD, fg=MUTED, font=("Segoe UI", 8)).pack(anchor="w")
+            for w in [rf, txt] + list(txt.winfo_children()):
+                w.bind("<Button-1>", lambda e, ci=cid: do_move(ci))
+                w.bind("<Enter>", lambda e, f=rf: f.configure(bg=BTN_HOV))
+                w.bind("<Leave>", lambda e, f=rf: f.configure(bg=CARD))
+            tk.Frame(inner, bg=BORDER, height=1).pack(fill=tk.X, padx=4)
+
+        tk.Button(win, text="Cancel", command=win.destroy,
+                  bg=BTN_BG, fg=TEXT, relief="flat", padx=14, pady=7,
+                  font=("Segoe UI", 9), cursor="hand2", bd=0,
+                  activebackground=BTN_HOV).pack(pady=8)
+
+    def _remove_photos_from_cluster(self, paths, from_cluster_id):
+        """Remove photos from cluster (set cluster_id to -1 = unassigned)."""
+        if not paths:
+            return
+        if not messagebox.askyesno("Remove from Cluster",
+                                   "Remove " + str(len(paths)) + " photo(s) from this cluster?\n"
+                                   "They will become unassigned (not deleted)."):
+            return
+        for path in paths:
+            self.db.move_image_to_cluster(path, from_cluster_id, -1)
+        self.face_thumb_cache.clear()
+        self.refresh_cluster_list()
+        self._show_cluster_photos(from_cluster_id)
+        self.status("Removed " + str(len(paths)) + " photo(s) from cluster.")
 
 
 
